@@ -1245,6 +1245,9 @@ jobs:
               @Published var progress = 0.0
               @Published var resultURL: URL?
               @Published var message: String?
+              @Published var quality = 1080          // короткая сторона итогового видео
+              @Published var canUndo = false
+              @Published var canRedo = false
 
               let player = AVPlayer()
               let videoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: [
@@ -1258,11 +1261,21 @@ jobs:
               private var rebuildTask: Task<Void, Never>?
               private var lastFrame: (Double, CGImage)?
               private var blobGen = 0
+              private var history: [Data] = []
+              private var histIdx = 0
+
+              private struct Snap: Codable {
+                  var clips: [Clip]
+                  var boxes: [Box]
+                  var music: Music?
+              }
 
               var total: Double { TL.total(clips) }
 
               init() {
                   load()
+                  cleanupMedia()
+                  if let d = snapshot() { history = [d] }
 
                   timeObs = player.addPeriodicTimeObserver(
                       forInterval: CMTime(value: 1, timescale: 30), queue: .main
@@ -1277,6 +1290,10 @@ jobs:
                   objectWillChange
                       .debounce(for: .seconds(1), scheduler: DispatchQueue.main)
                       .sink { [weak self] _ in self?.save() }
+                      .store(in: &bag)
+                  Publishers.CombineLatest3($clips, $boxes, $music)
+                      .debounce(for: .seconds(0.4), scheduler: DispatchQueue.main)
+                      .sink { [weak self] _, _, _ in self?.commitSnapshot() }
                       .store(in: &bag)
 
                   rebuild()
@@ -1308,6 +1325,77 @@ jobs:
                   if let d = try? JSONEncoder().encode(p) {
                       try? d.write(to: Store.projectURL, options: .atomic)
                   }
+              }
+
+              // MARK: - History
+
+              private func snapshot() -> Data? {
+                  try? JSONEncoder().encode(Snap(clips: clips, boxes: boxes, music: music))
+              }
+
+              private func updateUndoFlags() {
+                  canUndo = histIdx > 0
+                  canRedo = histIdx < history.count - 1
+              }
+
+              func commitSnapshot() {
+                  guard let d = snapshot() else { return }
+                  if histIdx < history.count, history[histIdx] == d { return }
+                  if histIdx < history.count - 1 { history.removeSubrange((histIdx + 1)...) }
+                  history.append(d)
+                  if history.count > 40 { history.removeFirst() }
+                  histIdx = history.count - 1
+                  updateUndoFlags()
+              }
+
+              func undo() {
+                  commitSnapshot()
+                  guard histIdx > 0 else { return }
+                  histIdx -= 1
+                  restore(history[histIdx])
+              }
+
+              func redo() {
+                  guard histIdx < history.count - 1 else { return }
+                  histIdx += 1
+                  restore(history[histIdx])
+              }
+
+              private func restore(_ d: Data) {
+                  guard let s = try? JSONDecoder().decode(Snap.self, from: d) else { return }
+                  pause()
+                  clips = s.clips
+                  boxes = s.boxes
+                  music = s.music
+                  if let sid = selectedBoxID, !boxes.contains(where: { $0.id == sid }) { selectedBoxID = nil }
+                  if !clips.contains(where: { $0.id == selectedClipID }) { selectedClipID = clips.first?.id }
+                  updateUndoFlags()
+                  rebuild()
+              }
+
+              /// Удаляет из Media файлы, которых нет в проекте (удалённые клипы нужны для undo до перезапуска).
+              private func cleanupMedia() {
+                  var used = Set(clips.map { $0.file })
+                  if let m = music { used.insert(m.file) }
+                  let fm = FileManager.default
+                  let files = (try? fm.contentsOfDirectory(atPath: Store.mediaDir.path)) ?? []
+                  for f in files where !used.contains(f) {
+                      try? fm.removeItem(at: Store.mediaDir.appendingPathComponent(f))
+                  }
+              }
+
+              func newProject() {
+                  pause()
+                  clips = []
+                  boxes = []
+                  music = nil
+                  selectedBoxID = nil
+                  selectedClipID = nil
+                  proposals = []
+                  blobRects = []
+                  currentTime = 0
+                  rebuild()
+                  commitSnapshot()
               }
 
               // MARK: - Composition / player
@@ -1401,6 +1489,32 @@ jobs:
                   return out
               }
 
+              func jumpPrev() {
+                  let pts = starts() + [total]
+                  if let p = pts.last(where: { $0 < currentTime - 0.05 }) { seek(p) } else { seek(0) }
+              }
+
+              func jumpNext() {
+                  let pts = starts() + [total]
+                  if let n = pts.first(where: { $0 > currentTime + 0.05 }) { seek(n) }
+              }
+
+              /// Где рамка живёт на таймлайне: (начало, конец) в секундах таймлайна.
+              func boxSpan(_ b: Box) -> (Double, Double)? {
+                  var s = 0.0
+                  for c in clips {
+                      if c.srcID == b.srcID && b.startT >= c.inT - 0.001 && b.startT <= c.outT + 0.001 {
+                          let lastT = (b.samples.last?.t ?? b.startT) + 0.12
+                          let endSrc = min(min(b.hideAfter ?? .infinity, lastT), c.outT)
+                          let a = s + (b.startT - c.inT)
+                          let e = s + (endSrc - c.inT)
+                          return (a, max(e, a + 0.1))
+                      }
+                      s += c.dur
+                  }
+                  return nil
+              }
+
               @MainActor
               func frameImage(at t: Double) async -> CGImage? {
                   guard let b = built else { return nil }
@@ -1471,9 +1585,7 @@ jobs:
                   pause()
                   guard let removed = clips.first(where: { $0.id == id }) else { return }
                   clips.removeAll { $0.id == id }
-                  if !clips.contains(where: { $0.file == removed.file }) {
-                      try? FileManager.default.removeItem(at: Store.mediaDir.appendingPathComponent(removed.file))
-                  }
+                  _ = removed
                   let used = Set(clips.map { $0.srcID })
                   boxes.removeAll { !used.contains($0.srcID) }
                   if let sid = selectedBoxID, !boxes.contains(where: { $0.id == sid }) { selectedBoxID = nil }
@@ -1491,6 +1603,26 @@ jobs:
               func muteAll(_ on: Bool) {
                   for i in clips.indices { clips[i].muted = on }
                   rebuild()
+              }
+
+              func deleteSelected() {
+                  if let id = selectedBoxID, boxes.contains(where: { $0.id == id }) {
+                      deleteBox(id)
+                  } else if let id = selectedClipID {
+                      removeClip(id)
+                  }
+              }
+
+              func toggleMuteSelected() {
+                  guard let i = clips.firstIndex(where: { $0.id == selectedClipID }) else { return }
+                  clips[i].muted.toggle()
+                  rebuild()
+              }
+
+              func retrackSelected() {
+                  guard let id = selectedBoxID,
+                        let r = visibleBoxes().first(where: { $0.box.id == id })?.rect else { return }
+                  commitEdit(id, r)
               }
 
               // MARK: - Music
@@ -1666,9 +1798,16 @@ jobs:
                   let cl = clips
                   let bx = boxes
                   let bs: BlobSettings? = useBlobs ? blob : nil
+                  let m = music
+                  let target = Editor.exportSize(renderSize, quality)
+                  let base = renderSize
                   Task { @MainActor in
                       do {
-                          let url = try await VideoExporter().run(built: b, clips: cl, boxes: bx, blobs: bs) { p in
+                          var bt = b
+                          if target != base {
+                              bt = try await Builder.build(clips: cl, music: m, render: target)
+                          }
+                          let url = try await VideoExporter().run(built: bt, clips: cl, boxes: bx, blobs: bs) { p in
                               DispatchQueue.main.async { self.progress = p }
                           }
                           self.resultURL = url
@@ -1677,6 +1816,15 @@ jobs:
                       }
                       self.exporting = false
                   }
+              }
+
+              static func exportSize(_ base: CGSize, _ short: Int) -> CGSize {
+                  let s = Double(min(base.width, base.height))
+                  guard s > 0 else { return base }
+                  let k = Double(short) / s
+                  let w = max(2, Int(Double(base.width) * k) & ~1)
+                  let h = max(2, Int(Double(base.height) * k) & ~1)
+                  return CGSize(width: w, height: h)
               }
 
               func saveToPhotos(_ url: URL) {
@@ -1694,6 +1842,448 @@ jobs:
               }
           }
           __BT_END__
+          cat > Sources/Theme.swift <<'__BT_END__'
+          import SwiftUI
+          import AVFoundation
+          import UIKit
+
+          enum Theme {
+              static let bg = Color(red: 0.05, green: 0.05, blue: 0.055)
+              static let tile = Color(red: 0.11, green: 0.11, blue: 0.115)
+              static let tileStroke = Color.white.opacity(0.09)
+              static let panel = Color(red: 0.085, green: 0.085, blue: 0.09)
+              static let track = Color(red: 0.13, green: 0.13, blue: 0.135)
+              static let accent = Color(red: 0.78, green: 0.95, blue: 0.0)
+              static let dim = Color.white.opacity(0.35)
+          }
+
+          /// Квадратная кнопка верхней панели.
+          struct ChromeButton<Label: View>: View {
+              let action: () -> Void
+              let label: Label
+              @Environment(\.isEnabled) private var isEnabled
+
+              init(action: @escaping () -> Void, @ViewBuilder label: () -> Label) {
+                  self.action = action
+                  self.label = label()
+              }
+
+              var body: some View {
+                  Button(action: action) {
+                      label
+                          .frame(minWidth: 44, minHeight: 44)
+                          .background(Theme.tile, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                          .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Theme.tileStroke, lineWidth: 1))
+                          .opacity(isEnabled ? 1 : 0.35)
+                  }
+                  .buttonStyle(.plain)
+              }
+          }
+
+          /// Плитка инструмента внизу.
+          struct ToolTile: View {
+              let icon: String
+              let title: String
+              var active = false
+
+              var body: some View {
+                  VStack(spacing: 7) {
+                      Image(systemName: icon)
+                          .font(.system(size: 24, weight: .semibold))
+                          .frame(height: 28)
+                      Text(title)
+                          .font(.system(size: 13, weight: .medium))
+                          .lineLimit(1)
+                  }
+                  .foregroundStyle(active ? Theme.accent : Color.white)
+                  .frame(width: 96, height: 78)
+                  .background(Theme.tile, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                  .overlay(
+                      RoundedRectangle(cornerRadius: 20, style: .continuous)
+                          .stroke(active ? Theme.accent.opacity(0.7) : Color.clear, lineWidth: 1.5)
+                  )
+              }
+          }
+
+          /// Таблетка-кнопка внутри панелей настроек.
+          struct ChipButtonStyle: ButtonStyle {
+              var danger = false
+              var selected = false
+
+              func makeBody(configuration: ButtonStyleConfiguration) -> some View {
+                  ChipBody(configuration: configuration, danger: danger, selected: selected)
+              }
+
+              private struct ChipBody: View {
+                  let configuration: ButtonStyleConfiguration
+                  let danger: Bool
+                  let selected: Bool
+                  @Environment(\.isEnabled) private var isEnabled
+
+                  var body: some View {
+                      configuration.label
+                          .font(.system(size: 14, weight: .semibold))
+                          .foregroundStyle(danger ? Color.red : (selected ? Theme.accent : Color.white))
+                          .padding(.horizontal, 14)
+                          .padding(.vertical, 9)
+                          .background(selected ? Theme.accent.opacity(0.18) : Theme.tile, in: Capsule())
+                          .overlay(Capsule().stroke(selected ? Theme.accent.opacity(0.7) : Theme.tileStroke, lineWidth: 1))
+                          .opacity(!isEnabled ? 0.35 : (configuration.isPressed ? 0.6 : 1))
+                  }
+              }
+          }
+
+          /// Миниатюры кадров для дорожки видео.
+          actor Thumbs {
+              static let shared = Thumbs()
+              private var gens: [String: AVAssetImageGenerator] = [:]
+              private var cache: [String: UIImage] = [:]
+
+              func image(file: String, time: Double) async -> UIImage? {
+                  let key = "\(file)@\(Int(time * 4))"
+                  if let c = cache[key] { return c }
+                  let gen: AVAssetImageGenerator
+                  if let g = gens[file] {
+                      gen = g
+                  } else {
+                      let g = AVAssetImageGenerator(asset: AVURLAsset(url: Store.mediaDir.appendingPathComponent(file)))
+                      g.appliesPreferredTrackTransform = true
+                      g.maximumSize = CGSize(width: 180, height: 180)
+                      let tol = CMTime(seconds: 0.4, preferredTimescale: 600)
+                      g.requestedTimeToleranceBefore = tol
+                      g.requestedTimeToleranceAfter = tol
+                      gens[file] = g
+                      gen = g
+                  }
+                  guard let res = try? await gen.image(at: CMTime(seconds: max(0, time), preferredTimescale: 600)) else { return nil }
+                  let ui = UIImage(cgImage: res.image)
+                  if cache.count > 400 { cache.removeAll() }
+                  cache[key] = ui
+                  return ui
+              }
+          }
+
+          struct ThumbTile: View {
+              let file: String
+              let time: Double
+              let width: CGFloat
+              let height: CGFloat
+              @State private var img: UIImage?
+
+              var body: some View {
+                  ZStack {
+                      Theme.track
+                      if let img {
+                          Image(uiImage: img)
+                              .resizable()
+                              .scaledToFill()
+                      }
+                  }
+                  .frame(width: width, height: height)
+                  .clipped()
+                  .task(id: Int(time * 4)) {
+                      img = await Thumbs.shared.image(file: file, time: time)
+                  }
+              }
+          }
+          __BT_END__
+          cat > Sources/Timeline.swift <<'__BT_END__'
+          import SwiftUI
+          import PhotosUI
+
+          /// Таймлайн: курсор стоит по центру, дорожки двигаются под ним.
+          /// Тянешь пальцем влево/вправо, чтобы перематывать.
+          struct EditorTimeline: View {
+              @ObservedObject var ed: Editor
+              let zoom: Double
+              @Binding var pickerItem: PhotosPickerItem?
+              let onMusicTap: () -> Void
+              let onBoxTap: () -> Void
+
+              @State private var dragStart: Double?
+
+              init(ed: Editor, zoom: Double, pickerItem: Binding<PhotosPickerItem?>,
+                   onMusicTap: @escaping () -> Void, onBoxTap: @escaping () -> Void) {
+                  _ed = ObservedObject(wrappedValue: ed)
+                  self.zoom = zoom
+                  _pickerItem = pickerItem
+                  self.onMusicTap = onMusicTap
+                  self.onBoxTap = onBoxTap
+              }
+
+              private let basePPS: Double = 40
+              private var pps: Double { basePPS * zoom }
+              private let rulerH: CGFloat = 22
+              private let timeH: CGFloat = 28
+              private let videoH: CGFloat = 56
+              private let musicH: CGFloat = 36
+              private let laneH: CGFloat = 28
+              private let gap: CGFloat = 8
+
+              private struct BoxPill: Identifiable {
+                  var id: UUID
+                  var lane: Int
+                  var a: Double
+                  var e: Double
+                  var box: Box
+              }
+
+              var body: some View {
+                  GeometryReader { geo in
+                      let gw = geo.size.width
+                      let cx = gw / 2
+                      let t = ed.currentTime
+                      let originX = cx - CGFloat(t * pps)
+                      let tracksTop = rulerH + timeH
+
+                      ZStack(alignment: .topLeading) {
+                          ruler(t: t)
+                              .frame(width: gw, height: rulerH)
+
+                          VStack(alignment: .leading, spacing: gap) {
+                              videoTrack(gw: gw)
+                              musicTrack(gw: gw)
+                              boxTracks()
+                          }
+                          .offset(x: originX, y: tracksTop)
+
+                          Text(timecode(t))
+                              .font(.system(size: 20, weight: .semibold).monospacedDigit())
+                              .foregroundStyle(.white)
+                              .padding(.horizontal, 6)
+                              .background(Theme.bg)
+                              .position(x: cx, y: rulerH + timeH / 2)
+                              .allowsHitTesting(false)
+
+                          Rectangle()
+                              .fill(Color.white)
+                              .frame(width: 2, height: rulerH)
+                              .position(x: cx, y: rulerH / 2)
+                              .allowsHitTesting(false)
+
+                          Rectangle()
+                              .fill(Color.white)
+                              .frame(width: 2, height: max(0, geo.size.height - tracksTop + 4))
+                              .position(x: cx, y: tracksTop - 4 + max(0, geo.size.height - tracksTop + 4) / 2)
+                              .allowsHitTesting(false)
+                      }
+                      .frame(width: gw, height: geo.size.height, alignment: .topLeading)
+                      .clipped()
+                      .contentShape(Rectangle())
+                      .simultaneousGesture(
+                          DragGesture(minimumDistance: 6)
+                              .onChanged { v in
+                                  if dragStart == nil {
+                                      dragStart = ed.currentTime
+                                      ed.pause()
+                                      ed.scrubbing = true
+                                  }
+                                  ed.seek((dragStart ?? 0) - Double(v.translation.width) / pps)
+                              }
+                              .onEnded { _ in
+                                  dragStart = nil
+                                  ed.scrubbing = false
+                              }
+                      )
+                  }
+              }
+
+              // MARK: - Ruler
+
+              private func tickStep() -> Double {
+                  for s in [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30] where s * pps >= 8 {
+                      return s
+                  }
+                  return 60
+              }
+
+              private func ruler(t: Double) -> some View {
+                  let total = ed.total
+                  let pps = self.pps
+                  let step = tickStep()
+                  return Canvas { ctx, size in
+                      let cx = size.width / 2
+                      let half = Double(cx) / pps
+                      let tMin = max(0, t - half)
+                      let tMax = min(total, t + half)
+                      if tMax >= tMin {
+                          let every = max(1, Int((1.0 / step).rounded()))
+                          var k = Int(floor(tMin / step))
+                          while Double(k) * step <= tMax + 1e-6 {
+                              let s = Double(k) * step
+                              if s >= -1e-6 {
+                                  let x = cx + CGFloat((s - t) * pps)
+                                  let major = step >= 1 ? (k % 5 == 0) : (k % every == 0)
+                                  let h: CGFloat = major ? 15 : 8
+                                  var p = Path()
+                                  p.move(to: CGPoint(x: x, y: 0))
+                                  p.addLine(to: CGPoint(x: x, y: h))
+                                  ctx.stroke(p, with: .color(.white.opacity(major ? 0.7 : 0.35)), lineWidth: 1)
+                              }
+                              k += 1
+                          }
+                      }
+                      let x0 = cx + CGFloat((0 - t) * pps)
+                      if x0 > -4 && x0 < size.width + 4 {
+                          ctx.fill(Path(CGRect(x: x0 - 1, y: 0, width: 3, height: 16)), with: .color(Theme.accent))
+                      }
+                  }
+              }
+
+              private func timecode(_ t: Double) -> String {
+                  let tt = max(0, t)
+                  let m = Int(tt) / 60
+                  let s = Int(tt) % 60
+                  let f = Int((tt - floor(tt)) * 30)
+                  return String(format: "%02d:%02d:%02d", m, s, f)
+              }
+
+              // MARK: - Tracks
+
+              private func pill(_ icon: String, _ title: String, width: CGFloat, height: CGFloat) -> some View {
+                  HStack(spacing: 10) {
+                      Image(systemName: icon)
+                          .font(.system(size: 16, weight: .semibold))
+                      Text(title)
+                          .font(.system(size: 15, weight: .semibold).italic())
+                          .lineLimit(1)
+                  }
+                  .foregroundStyle(Color.white.opacity(0.75))
+                  .padding(.horizontal, 12)
+                  .frame(width: width, height: height, alignment: .leading)
+                  .background(Theme.track, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+              }
+
+              @ViewBuilder
+              private func videoTrack(gw: CGFloat) -> some View {
+                  if ed.clips.isEmpty {
+                      PhotosPicker(selection: $pickerItem, matching: .videos) {
+                          pill("play.rectangle", "Добавить видео", width: gw / 2 - 12, height: videoH)
+                      }
+                      .buttonStyle(.plain)
+                  } else {
+                      HStack(spacing: 0) {
+                          ForEach(ed.clips) { c in
+                              clipView(c)
+                          }
+                      }
+                  }
+              }
+
+              private func clipView(_ c: Clip) -> some View {
+                  let w = max(20, CGFloat(c.dur * pps))
+                  let maxTiles = 40
+                  let tileW = max(videoH, w / CGFloat(maxTiles))
+                  let n = max(1, Int(ceil(w / tileW)))
+                  let selected = c.id == ed.selectedClipID
+                  return HStack(spacing: 0) {
+                      ForEach(0..<n, id: \.self) { k in
+                          let ts = min(c.outT - 0.05, c.inT + (Double(k) + 0.5) * Double(tileW) / pps)
+                          ThumbTile(file: c.file, time: max(c.inT, ts), width: tileW, height: videoH)
+                      }
+                  }
+                  .frame(width: w, height: videoH, alignment: .leading)
+                  .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                  .overlay(alignment: .topLeading) {
+                      if c.muted {
+                          Image(systemName: "speaker.slash.fill")
+                              .font(.system(size: 11, weight: .bold))
+                              .padding(5)
+                              .background(Color.black.opacity(0.55), in: Circle())
+                              .padding(4)
+                      }
+                  }
+                  .overlay(
+                      RoundedRectangle(cornerRadius: 10, style: .continuous)
+                          .stroke(selected ? Theme.accent : Color.black.opacity(0.6), lineWidth: selected ? 2.5 : 1)
+                  )
+                  .contentShape(Rectangle())
+                  .onTapGesture { ed.selectedClipID = c.id }
+              }
+
+              @ViewBuilder
+              private func musicTrack(gw: CGFloat) -> some View {
+                  if let m = ed.music {
+                      let w = max(14, CGFloat(max(0, min(m.dur - m.inT, ed.total - m.start)) * pps))
+                      ZStack(alignment: .topLeading) {
+                          HStack(spacing: 8) {
+                              Image(systemName: "music.note").font(.system(size: 13, weight: .bold))
+                              Text(m.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                          }
+                          .padding(.horizontal, 10)
+                          .frame(width: w, height: musicH, alignment: .leading)
+                          .background(Theme.accent.opacity(0.22), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                          .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Theme.accent.opacity(0.8), lineWidth: 1))
+                          .foregroundStyle(Theme.accent)
+                          .offset(x: CGFloat(m.start * pps))
+                          .onTapGesture { onMusicTap() }
+                      }
+                      .frame(width: max(1, CGFloat(ed.total * pps)), height: musicH, alignment: .topLeading)
+                  } else {
+                      Button(action: onMusicTap) {
+                          pill("music.note", "Добавить музыку", width: gw / 2 - 12, height: musicH)
+                      }
+                      .buttonStyle(.plain)
+                  }
+              }
+
+              private func pills() -> [BoxPill] {
+                  var items: [(Box, Double, Double)] = []
+                  for b in ed.boxes {
+                      if let sp = ed.boxSpan(b) { items.append((b, sp.0, sp.1)) }
+                  }
+                  items.sort { $0.1 < $1.1 }
+                  var laneEnds: [Double] = []
+                  var out: [BoxPill] = []
+                  for (b, a, e) in items {
+                      var lane = laneEnds.firstIndex(where: { $0 <= a + 0.001 }) ?? -1
+                      if lane < 0 {
+                          laneEnds.append(e)
+                          lane = laneEnds.count - 1
+                      } else {
+                          laneEnds[lane] = e
+                      }
+                      out.append(BoxPill(id: b.id, lane: lane, a: a, e: e, box: b))
+                  }
+                  return out
+              }
+
+              @ViewBuilder
+              private func boxTracks() -> some View {
+                  let ps = pills()
+                  if !ps.isEmpty {
+                      let lanes = (ps.map { $0.lane }.max() ?? 0) + 1
+                      ZStack(alignment: .topLeading) {
+                          ForEach(ps) { p in
+                              let selected = ed.selectedBoxID == p.id
+                              let col = p.box.color.ui
+                              RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                  .fill(col.opacity(0.28))
+                                  .overlay(
+                                      RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                          .stroke(col, lineWidth: selected ? 2.5 : 1.2)
+                                  )
+                                  .overlay(alignment: .leading) {
+                                      Text(p.box.label.isEmpty ? "Рамка" : p.box.label)
+                                          .font(.system(size: 11, weight: .semibold))
+                                          .foregroundStyle(.white)
+                                          .lineLimit(1)
+                                          .padding(.horizontal, 6)
+                                  }
+                                  .frame(width: max(18, CGFloat((p.e - p.a) * pps)), height: laneH - 4)
+                                  .offset(x: CGFloat(p.a * pps), y: CGFloat(p.lane) * laneH)
+                                  .onTapGesture {
+                                      ed.selectedBoxID = p.id
+                                      ed.jump(toBox: p.box)
+                                      onBoxTap()
+                                  }
+                          }
+                      }
+                      .frame(width: max(1, CGFloat(ed.total * pps)), height: CGFloat(lanes) * laneH, alignment: .topLeading)
+                  }
+              }
+          }
+          __BT_END__
           cat > Sources/ContentView.swift <<'__BT_END__'
           import SwiftUI
           import PhotosUI
@@ -1704,9 +2294,12 @@ jobs:
           struct ContentView: View {
               @StateObject private var ed = Editor()
               @State private var pickerItem: PhotosPickerItem?
-              @State private var tab: Tab = .clip
+              @State private var panel: Panel?
               @State private var showMusicPicker = false
+              @State private var showHelp = false
+              @State private var confirmClose = false
               @State private var detectMode: DetectMode = .rects
+              @State private var zoomIdx = 1
 
               // жесты на превью
               @State private var dragKind: DragKind = .none
@@ -1715,10 +2308,12 @@ jobs:
               @State private var overrideRect: CGRect = .zero
               @State private var draft: CGRect?
 
-              enum Tab: String, CaseIterable, Identifiable {
-                  case clip = "Клип"
+              private let zooms: [Double] = [0.5, 1, 2, 4]
+
+              enum Panel: String, Identifiable {
                   case boxes = "Рамки"
                   case blobs = "Блобы"
+                  case trim = "Обрезка"
                   case audio = "Звук"
                   var id: String { rawValue }
               }
@@ -1733,91 +2328,162 @@ jobs:
               }
 
               var body: some View {
-                  NavigationStack {
-                      VStack(spacing: 8) {
-                          previewArea
-                          transport
-                          ScrollView {
-                              VStack(spacing: 12) {
-                                  timeline
-                                  Picker("Раздел", selection: $tab) {
-                                      ForEach(Tab.allCases) { Text($0.rawValue).tag($0) }
-                                  }
-                                  .pickerStyle(.segmented)
-                                  tabContent
+                  VStack(spacing: 0) {
+                      topBar
+                          .padding(.horizontal, 16)
+                          .padding(.top, 6)
+                          .alert("Как пользоваться", isPresented: $showHelp) {
+                              Button("OK", role: .cancel) {}
+                          } message: {
+                              Text("Рамка: открой «Рамки» и нарисуй её пальцем на кадре, дальше она поедет за объектом сама. Тащи рамку или белую точку в углу, чтобы поправить: трекинг пересчитается с этого кадра.\n\nТаймлайн: тяни его пальцем, курсор стоит по центру. Тап по клипу выбирает его, тап по рамке в нижней дорожке открывает её настройки.\n\nБлобы: рамки вокруг ярких, тёмных или одноцветных пятен на всём видео.")
+                          }
+
+                      previewArea
+                          .frame(maxWidth: .infinity, maxHeight: .infinity)
+                          .padding(.vertical, 10)
+
+                      controls
+                          .padding(.horizontal, 16)
+                          .padding(.bottom, 6)
+                          .alert("Закрыть проект?", isPresented: $confirmClose) {
+                              Button("Закрыть", role: .destructive) {
+                                  panel = nil
+                                  ed.newProject()
                               }
-                              .padding(.horizontal)
-                              .padding(.bottom, 24)
+                              Button("Отмена", role: .cancel) {}
+                          } message: {
+                              Text("Все клипы и рамки уберутся. Это можно отменить стрелкой «назад».")
                           }
-                      }
-                      .navigationTitle("BlobTracker")
-                      .navigationBarTitleDisplayMode(.inline)
-                      .toolbar {
-                          ToolbarItem(placement: .topBarTrailing) {
-                              if ed.exporting {
-                                  ProgressView(value: ed.progress).frame(width: 80)
-                              } else {
-                                  Button("Экспорт") { ed.export() }
-                                      .disabled(ed.clips.isEmpty)
-                              }
+
+                      EditorTimeline(
+                          ed: ed,
+                          zoom: zooms[zoomIdx],
+                          pickerItem: $pickerItem,
+                          onMusicTap: {
+                              if ed.music == nil { showMusicPicker = true } else { panel = .audio }
+                          },
+                          onBoxTap: { panel = .boxes }
+                      )
+                      .frame(height: 190)
+
+                      bottomArea
+                  }
+                  .background(Theme.bg.ignoresSafeArea())
+                  .animation(.easeInOut(duration: 0.22), value: panel)
+                  .onChange(of: pickerItem) { _, item in
+                      guard let item else { return }
+                      Task { @MainActor in
+                          if let v = try? await item.loadTransferable(type: VideoFile.self) {
+                              ed.addVideo(v.url)
+                          } else {
+                              ed.message = "Не получилось загрузить видео"
                           }
-                      }
-                      .onChange(of: pickerItem) { _, item in
-                          guard let item else { return }
-                          Task { @MainActor in
-                              if let v = try? await item.loadTransferable(type: VideoFile.self) {
-                                  ed.addVideo(v.url)
-                              } else {
-                                  ed.message = "Не получилось загрузить видео"
-                              }
-                              pickerItem = nil
-                          }
-                      }
-                      .fileImporter(isPresented: $showMusicPicker, allowedContentTypes: [.audio]) { result in
-                          if case .success(let url) = result { ed.addMusic(url) }
-                      }
-                      .sheet(isPresented: Binding(
-                          get: { ed.resultURL != nil },
-                          set: { if !$0 { ed.resultURL = nil } }
-                      )) {
-                          if let url = ed.resultURL {
-                              ResultView(url: url) { ed.saveToPhotos(url) }
-                          }
-                      }
-                      .alert("BlobTracker", isPresented: Binding(
-                          get: { ed.message != nil },
-                          set: { if !$0 { ed.message = nil } }
-                      )) {
-                          Button("OK", role: .cancel) {}
-                      } message: {
-                          Text(ed.message ?? "")
+                          pickerItem = nil
                       }
                   }
+                  .fileImporter(isPresented: $showMusicPicker, allowedContentTypes: [.audio]) { result in
+                      if case .success(let url) = result { ed.addMusic(url) }
+                  }
+                  .sheet(isPresented: Binding(
+                      get: { ed.resultURL != nil },
+                      set: { if !$0 { ed.resultURL = nil } }
+                  )) {
+                      if let url = ed.resultURL {
+                          ResultView(url: url) { ed.saveToPhotos(url) }
+                      }
+                  }
+                  .alert("BlobTracker", isPresented: Binding(
+                      get: { ed.message != nil },
+                      set: { if !$0 { ed.message = nil } }
+                  )) {
+                      Button("OK", role: .cancel) {}
+                  } message: {
+                      Text(ed.message ?? "")
+                  }
+              }
+
+              // MARK: - Top bar
+
+              private var topBar: some View {
+                  HStack(spacing: 10) {
+                      ChromeButton(action: { confirmClose = true }) {
+                          Image(systemName: "xmark").font(.system(size: 18, weight: .bold))
+                      }
+                      .disabled(ed.clips.isEmpty && ed.music == nil)
+
+                      Spacer()
+
+                      ChromeButton(action: { showHelp = true }) {
+                          Image(systemName: "questionmark.circle.fill").font(.system(size: 26))
+                      }
+
+                      ChromeButton(action: { ed.splitAtPlayhead() }) {
+                          Image(systemName: "scissors").font(.system(size: 19, weight: .semibold))
+                      }
+                      .disabled(ed.clips.isEmpty)
+
+                      Menu {
+                          Picker("Качество", selection: $ed.quality) {
+                              ForEach([720, 1080, 1440], id: \.self) { q in
+                                  Text("\(q)p").tag(q)
+                              }
+                          }
+                      } label: {
+                          HStack(spacing: 6) {
+                              Text("\(ed.quality)p").font(.system(size: 16, weight: .bold).italic())
+                              Image(systemName: "arrowtriangle.down.fill").font(.system(size: 10))
+                          }
+                          .foregroundStyle(.white)
+                          .padding(.horizontal, 14)
+                          .frame(minHeight: 44)
+                          .background(Theme.tile, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                          .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Theme.tileStroke, lineWidth: 1))
+                      }
+
+                      ChromeButton(action: { ed.export() }) {
+                          if ed.exporting {
+                              ProgressView(value: ed.progress)
+                                  .progressViewStyle(.circular)
+                                  .tint(Theme.accent)
+                          } else {
+                              Image(systemName: "square.and.arrow.down").font(.system(size: 19, weight: .semibold))
+                          }
+                      }
+                      .disabled(ed.clips.isEmpty || ed.exporting)
+                  }
+                  .foregroundStyle(.white)
               }
 
               // MARK: - Preview
 
               @ViewBuilder
               private var previewArea: some View {
+                  let ratio = max(0.2, ed.renderSize.width / ed.renderSize.height)
                   if ed.clips.isEmpty {
                       PhotosPicker(selection: $pickerItem, matching: .videos) {
-                          VStack(spacing: 8) {
-                              Image(systemName: "video.badge.plus").font(.largeTitle)
-                              Text("Добавить видео")
+                          VStack(spacing: 10) {
+                              Image(systemName: "film.stack")
+                                  .font(.system(size: 54, weight: .regular))
+                                  .foregroundStyle(Color(white: 0.72))
+                              Text("Нет материала")
+                                  .font(.system(size: 22, weight: .bold))
+                                  .foregroundStyle(Color(white: 0.55))
+                              Text("Нажми, чтобы добавить видео")
+                                  .font(.system(size: 16, weight: .medium))
+                                  .foregroundStyle(Color(white: 0.75))
                           }
-                          .frame(maxWidth: .infinity, minHeight: 220)
-                          .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+                          .frame(maxWidth: .infinity, maxHeight: .infinity)
+                          .background(Color(white: 0.97))
                       }
-                      .padding(.horizontal)
+                      .buttonStyle(.plain)
+                      .aspectRatio(ratio, contentMode: .fit)
                   } else {
                       ZStack {
                           PlayerView(player: ed.player)
                           overlay
                       }
-                      .aspectRatio(ed.renderSize.width / ed.renderSize.height, contentMode: .fit)
-                      .frame(maxHeight: 360)
-                      .clipShape(RoundedRectangle(cornerRadius: 8))
-                      .padding(.horizontal)
+                      .aspectRatio(ratio, contentMode: .fit)
+                      .clipShape(RoundedRectangle(cornerRadius: 4))
                   }
               }
 
@@ -1898,7 +2564,7 @@ jobs:
               }
 
               private func beginKind(_ p: CGPoint, _ W: CGFloat, _ H: CGFloat) -> DragKind {
-                  if ed.useBlobs && tab == .blobs { return .pick }
+                  if ed.useBlobs && panel == .blobs { return .pick }
                   let n = CGPoint(x: p.x / W, y: 1 - p.y / H)
                   let vis = ed.visibleBoxes()
 
@@ -1965,6 +2631,7 @@ jobs:
                           let h = min(1 - yTop, d.height / H)
                           if w > 0.01 && h > 0.01 {
                               ed.addBox(CGRect(x: x, y: 1 - yTop - h, width: w, height: h))
+                              panel = .boxes
                           }
                       } else {
                           ed.selectedBoxID = nil
@@ -1973,6 +2640,7 @@ jobs:
                       if moved <= 10 {
                           ed.addBox(r)
                           ed.proposals.removeAll { $0 == r }
+                          panel = .boxes
                       }
                   case .pick:
                       if moved <= 10 {
@@ -1987,171 +2655,188 @@ jobs:
                   draft = nil
               }
 
-              // MARK: - Transport / timeline
+              // MARK: - Controls row
 
-              private func timeString(_ t: Double) -> String {
-                  String(format: "%d:%04.1f", Int(t) / 60, t.truncatingRemainder(dividingBy: 60))
-              }
-
-              private var transport: some View {
-                  HStack(spacing: 10) {
-                      Button { ed.togglePlay() } label: {
-                          Image(systemName: ed.isPlaying ? "pause.fill" : "play.fill")
-                              .frame(width: 30, height: 24)
-                      }
-                      .buttonStyle(.bordered)
-                      .disabled(ed.clips.isEmpty)
-
-                      Text(timeString(ed.currentTime) + " / " + timeString(ed.total))
-                          .font(.caption.monospacedDigit())
-
-                      Slider(
-                          value: Binding(get: { ed.currentTime }, set: { ed.seek($0) }),
-                          in: 0...max(0.1, ed.total),
-                          onEditingChanged: { editing in
-                              ed.scrubbing = editing
-                              if editing { ed.pause() }
-                          }
-                      )
-
-                      if ed.busy { ProgressView() }
+              private func iconButton(_ name: String, size: CGFloat = 20, enabled: Bool = true,
+                                      action: @escaping () -> Void) -> some View {
+                  Button(action: action) {
+                      Image(systemName: name)
+                          .font(.system(size: size, weight: .semibold))
+                          .foregroundStyle(.white)
+                          .frame(width: 36, height: 36)
+                          .opacity(enabled ? 1 : 0.3)
                   }
-                  .padding(.horizontal)
+                  .buttonStyle(.plain)
+                  .disabled(!enabled)
               }
 
-              private var timeline: some View {
-                  let pps: CGFloat = 36
-                  let starts = ed.starts()
-                  return ScrollView(.horizontal, showsIndicators: false) {
-                      VStack(alignment: .leading, spacing: 4) {
-                          HStack(spacing: 0) {
-                              ForEach(Array(ed.clips.enumerated()), id: \.element.id) { i, c in
-                                  ZStack {
-                                      RoundedRectangle(cornerRadius: 6)
-                                          .fill(c.id == ed.selectedClipID ? Color.blue.opacity(0.55) : Color.white.opacity(0.18))
-                                      RoundedRectangle(cornerRadius: 6)
-                                          .stroke(c.id == ed.selectedClipID ? Color.blue : Color.white.opacity(0.4), lineWidth: 1.5)
-                                      VStack(spacing: 2) {
-                                          Text(String(format: "%.1f с", c.dur)).font(.caption2)
-                                          if c.muted { Image(systemName: "speaker.slash.fill").font(.caption2) }
-                                      }
-                                  }
-                                  .frame(width: max(24, CGFloat(c.dur) * pps), height: 52)
-                                  .gesture(SpatialTapGesture().onEnded { v in
-                                      ed.selectedClipID = c.id
-                                      if starts.indices.contains(i) {
-                                          ed.seek(starts[i] + Double(v.location.x / pps))
-                                      }
-                                  })
-                              }
-                          }
-                          if let m = ed.music {
-                              let w = CGFloat(max(0, min(m.dur - m.inT, ed.total - m.start))) * pps
-                              RoundedRectangle(cornerRadius: 4)
-                                  .fill(Color.purple.opacity(0.6))
-                                  .frame(width: w, height: 14)
-                                  .offset(x: CGFloat(m.start) * pps)
-                          }
+              private var controls: some View {
+                  HStack(spacing: 6) {
+                      iconButton("arrow.uturn.backward", enabled: ed.canUndo) { ed.undo() }
+                      iconButton("arrow.uturn.forward", enabled: ed.canRedo) { ed.redo() }
+
+                      Button {
+                          zoomIdx = (zoomIdx + 1) % zooms.count
+                      } label: {
+                          Text(zooms[zoomIdx] < 1 ? "×½" : "×\(Int(zooms[zoomIdx]))")
+                              .font(.system(size: 15, weight: .bold, design: .rounded))
+                              .foregroundStyle(.white)
+                              .padding(.horizontal, 9)
+                              .frame(height: 30)
+                              .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.white, lineWidth: 2))
                       }
-                      .overlay(alignment: .topLeading) {
-                          Rectangle()
-                              .fill(Color.white)
-                              .frame(width: 2, height: 52)
-                              .offset(x: CGFloat(ed.currentTime) * pps)
-                              .allowsHitTesting(false)
+                      .buttonStyle(.plain)
+                      .padding(.leading, 4)
+
+                      Spacer(minLength: 4)
+
+                      iconButton("arrowtriangle.left.fill", size: 18, enabled: !ed.clips.isEmpty) { ed.jumpPrev() }
+                      iconButton(ed.isPlaying ? "pause.fill" : "play.fill", size: 28, enabled: !ed.clips.isEmpty) { ed.togglePlay() }
+                      iconButton("arrowtriangle.right.fill", size: 18, enabled: !ed.clips.isEmpty) { ed.jumpNext() }
+
+                      Spacer(minLength: 4)
+
+                      iconButton("trash", enabled: !ed.clips.isEmpty) { ed.deleteSelected() }
+                      iconButton(selectedMuted ? "speaker.slash.fill" : "speaker.wave.2.fill", enabled: !ed.clips.isEmpty) {
+                          ed.toggleMuteSelected()
                       }
-                      .padding(.trailing, 40)
                   }
-                  .frame(height: 76)
               }
 
-              // MARK: - Tabs
+              private var selectedMuted: Bool {
+                  ed.clips.first(where: { $0.id == ed.selectedClipID })?.muted ?? false
+              }
+
+              // MARK: - Bottom area
 
               @ViewBuilder
-              private var tabContent: some View {
-                  switch tab {
-                  case .clip: panel { clipTab }
-                  case .boxes: panel { boxesTab }
-                  case .blobs: panel { blobsTab }
-                  case .audio: panel { audioTab }
+              private var bottomArea: some View {
+                  if let p = panel {
+                      panelView(p)
+                          .transition(.move(edge: .bottom))
+                  } else {
+                      toolRow
+                          .transition(.opacity)
                   }
               }
 
-              private func panel<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
-                  content()
-                      .frame(maxWidth: .infinity, alignment: .leading)
-                      .padding(12)
-                      .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+              private func tile(_ icon: String, _ title: String, active: Bool = false, enabled: Bool = true,
+                                action: @escaping () -> Void) -> some View {
+                  Button(action: action) {
+                      ToolTile(icon: icon, title: title, active: active)
+                          .opacity(enabled ? 1 : 0.35)
+                  }
+                  .buttonStyle(.plain)
+                  .disabled(!enabled)
               }
 
-              private var clipTab: some View {
-                  VStack(alignment: .leading, spacing: 10) {
-                      HStack {
+              private var toolRow: some View {
+                  ScrollView(.horizontal, showsIndicators: false) {
+                      HStack(spacing: 10) {
                           PhotosPicker(selection: $pickerItem, matching: .videos) {
-                              Label("Добавить видео", systemImage: "plus.rectangle.on.rectangle")
+                              ToolTile(icon: "play.rectangle.fill", title: "Видео")
                           }
-                          .buttonStyle(.bordered)
-                          Button { ed.splitAtPlayhead() } label: {
-                              Label("Разрезать", systemImage: "scissors")
-                          }
-                          .buttonStyle(.bordered)
-                          .disabled(ed.clips.isEmpty)
+                          .buttonStyle(.plain)
+
+                          tile("music.note", "Музыка") { showMusicPicker = true }
+                          tile("viewfinder", "Рамки", enabled: !ed.clips.isEmpty) { panel = .boxes }
+                          tile("circle.dotted", "Блобы", enabled: !ed.clips.isEmpty) { panel = .blobs }
+                          tile("scissors", "Разрезать", enabled: !ed.clips.isEmpty) { ed.splitAtPlayhead() }
+                          tile("slider.horizontal.3", "Обрезка", enabled: !ed.clips.isEmpty) { panel = .trim }
+                          tile("speaker.wave.2.fill", "Звук") { panel = .audio }
                       }
+                      .padding(.horizontal, 16)
+                      .padding(.vertical, 8)
+                  }
+                  .frame(height: 100)
+              }
 
-                      if let i = ed.clips.firstIndex(where: { $0.id == ed.selectedClipID }) {
-                          HStack {
-                              Button { ed.move(i, -1) } label: { Image(systemName: "arrow.left") }
-                              Button { ed.move(i, 1) } label: { Image(systemName: "arrow.right") }
-                              Button {
-                                  ed.clips[i].muted.toggle()
-                                  ed.rebuild()
-                              } label: {
-                                  Image(systemName: ed.clips[i].muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                              }
-                              Spacer()
-                              Button(role: .destructive) {
-                                  ed.removeClip(ed.clips[i].id)
-                              } label: {
-                                  Image(systemName: "trash")
+              private func panelView(_ p: Panel) -> some View {
+                  VStack(spacing: 0) {
+                      HStack {
+                          Text(p.rawValue).font(.system(size: 17, weight: .bold))
+                          Spacer()
+                          Button { panel = nil } label: {
+                              Image(systemName: "checkmark")
+                                  .font(.system(size: 15, weight: .bold))
+                                  .foregroundStyle(.black)
+                                  .frame(width: 44, height: 32)
+                                  .background(Theme.accent, in: Capsule())
+                          }
+                          .buttonStyle(.plain)
+                      }
+                      .padding(.horizontal, 16)
+                      .padding(.vertical, 10)
+
+                      ScrollView {
+                          VStack(alignment: .leading, spacing: 12) {
+                              switch p {
+                              case .boxes: boxesBody
+                              case .blobs: blobsBody
+                              case .trim: trimBody
+                              case .audio: audioBody
                               }
                           }
-                          .buttonStyle(.bordered)
+                          .frame(maxWidth: .infinity, alignment: .leading)
+                          .padding(.horizontal, 16)
+                          .padding(.bottom, 20)
+                      }
+                  }
+                  .frame(height: 270)
+                  .background {
+                      UnevenRoundedRectangle(topLeadingRadius: 24, topTrailingRadius: 24)
+                          .fill(Theme.panel)
+                          .ignoresSafeArea(edges: .bottom)
+                  }
+                  .tint(Theme.accent)
+              }
 
-                          trimSlider("Начало клипа", $ed.clips[i].inT,
-                                     0...max(0.1, ed.clips[i].outT - 0.2))
-                          trimSlider("Конец клипа", $ed.clips[i].outT,
-                                     (ed.clips[i].inT + 0.2)...max(ed.clips[i].inT + 0.3, ed.clips[i].srcDur))
-                      } else {
-                          Text("Тапни по клипу на таймлайне, чтобы обрезать, убрать звук или удалить.")
-                              .font(.footnote)
+              private func hint(_ s: String) -> some View {
+                  Text(s).font(.footnote).foregroundStyle(.secondary)
+              }
+
+              private func valueSlider(_ title: String, _ value: Binding<Double>, _ range: ClosedRange<Double>,
+                                       format: String = "%.2f", onEnd: (() -> Void)? = nil) -> some View {
+                  VStack(alignment: .leading, spacing: 2) {
+                      HStack {
+                          Text(title).font(.footnote)
+                          Spacer()
+                          Text(String(format: format, value.wrappedValue))
+                              .font(.footnote.monospacedDigit())
                               .foregroundStyle(.secondary)
                       }
-                  }
-              }
-
-              private func trimSlider(_ title: String, _ value: Binding<Double>, _ range: ClosedRange<Double>) -> some View {
-                  VStack(alignment: .leading, spacing: 2) {
-                      Text("\(title): \(String(format: "%.2f", value.wrappedValue)) с").font(.footnote)
                       Slider(value: value, in: range, onEditingChanged: { editing in
-                          if !editing { ed.rebuild() }
+                          if !editing { onEnd?() }
                       })
                   }
               }
 
-              private var boxesTab: some View {
-                  VStack(alignment: .leading, spacing: 10) {
-                      Text("Нарисуй рамку пальцем прямо на кадре: трекинг пойдёт от этого момента. Тап по рамке выбирает её. Тащи рамку или белую точку в углу: трекинг пересчитается с этого кадра.")
-                          .font(.footnote)
-                          .foregroundStyle(.secondary)
+              // MARK: - Panel: boxes
+
+              private var boxesBody: some View {
+                  VStack(alignment: .leading, spacing: 12) {
+                      hint("Нарисуй рамку пальцем на кадре, трекинг пойдёт от этого момента. Тащи рамку или белую точку в углу: трекинг пересчитается с этого кадра.")
 
                       HStack {
-                          Picker("Что искать", selection: $detectMode) {
-                              ForEach(DetectMode.allCases) { Text($0.rawValue).tag($0) }
+                          Menu {
+                              Picker("Что искать", selection: $detectMode) {
+                                  ForEach(DetectMode.allCases) { Text($0.rawValue).tag($0) }
+                              }
+                          } label: {
+                              HStack(spacing: 6) {
+                                  Text(detectMode.rawValue)
+                                  Image(systemName: "chevron.down").font(.system(size: 11, weight: .bold))
+                              }
+                              .font(.system(size: 14, weight: .semibold))
+                              .padding(.horizontal, 14)
+                              .padding(.vertical, 9)
+                              .background(Theme.tile, in: Capsule())
+                              .overlay(Capsule().stroke(Theme.tileStroke, lineWidth: 1))
                           }
-                          .pickerStyle(.menu)
                           Button("Найти на кадре") { ed.detect(detectMode) }
-                              .buttonStyle(.bordered)
+                              .buttonStyle(ChipButtonStyle())
                               .disabled(ed.clips.isEmpty)
+                          if ed.busy { ProgressView() }
                       }
 
                       if !ed.boxes.isEmpty {
@@ -2162,8 +2847,7 @@ jobs:
                                           ed.selectedBoxID = b.id
                                           ed.jump(toBox: b)
                                       }
-                                      .buttonStyle(.bordered)
-                                      .tint(ed.selectedBoxID == b.id ? Color.red : Color.gray)
+                                      .buttonStyle(ChipButtonStyle(selected: ed.selectedBoxID == b.id))
                                   }
                               }
                           }
@@ -2185,9 +2869,8 @@ jobs:
                                   ed.boxes[i].color = .green
                                   ed.boxes[i].textColor = .green
                               }
-                              Spacer()
                           }
-                          .buttonStyle(.bordered)
+                          .buttonStyle(ChipButtonStyle())
 
                           ColorRow(title: "Цвет рамки", selection: $ed.boxes[i].color)
                           ColorRow(title: "Цвет текста", selection: $ed.boxes[i].textColor)
@@ -2197,27 +2880,24 @@ jobs:
                               Button("Конец тут") { ed.setEndHere(id) }
                               Button("Без конца") { ed.clearEnd(id) }
                           }
-                          .buttonStyle(.bordered)
-                          .font(.footnote)
+                          .buttonStyle(ChipButtonStyle())
 
                           HStack {
-                              Button("Перетрекать отсюда") {
-                                  if let r = ed.visibleBoxes().first(where: { $0.box.id == id })?.rect {
-                                      ed.commitEdit(id, r)
-                                  }
-                              }
-                              .buttonStyle(.bordered)
+                              Button("Перетрекать отсюда") { ed.retrackSelected() }
+                                  .buttonStyle(ChipButtonStyle())
                               Spacer()
-                              Button("Удалить рамку", role: .destructive) { ed.deleteBox(id) }
-                                  .buttonStyle(.bordered)
+                              Button("Удалить") { ed.deleteBox(id) }
+                                  .buttonStyle(ChipButtonStyle(danger: true))
                           }
                       }
                   }
               }
 
-              private var blobsTab: some View {
-                  VStack(alignment: .leading, spacing: 10) {
-                      Toggle("Блобы включены (на всё видео)", isOn: $ed.useBlobs)
+              // MARK: - Panel: blobs
+
+              private var blobsBody: some View {
+                  VStack(alignment: .leading, spacing: 12) {
+                      Toggle("Блобы на всё видео", isOn: $ed.useBlobs)
 
                       if ed.useBlobs {
                           Picker("Что ловить", selection: $ed.blob.kind) {
@@ -2231,17 +2911,15 @@ jobs:
                                   Circle()
                                       .fill(Color(red: ed.blob.tr, green: ed.blob.tg, blue: ed.blob.tb))
                                       .frame(width: 22, height: 22)
-                                  Text("тапни по кадру, чтобы выбрать")
-                                      .font(.footnote)
-                                      .foregroundStyle(.secondary)
+                                  hint("тапни по кадру, чтобы выбрать")
                               }
-                              sliderRow("Допуск цвета", $ed.blob.tolerance, 0.05...0.7)
+                              valueSlider("Допуск цвета", $ed.blob.tolerance, 0.05...0.7)
                           } else {
-                              sliderRow(ed.blob.kind == .bright ? "Порог яркости" : "Порог темноты",
-                                        $ed.blob.threshold, 0.05...0.95)
+                              valueSlider(ed.blob.kind == .bright ? "Порог яркости" : "Порог темноты",
+                                          $ed.blob.threshold, 0.05...0.95)
                           }
 
-                          sliderRow("Минимальный размер пятна", $ed.blob.minArea, 0.0003...0.05)
+                          valueSlider("Минимальный размер пятна", $ed.blob.minArea, 0.0003...0.05, format: "%.4f")
                           Stepper("Макс. рамок: \(ed.blob.maxBlobs)", value: $ed.blob.maxBlobs, in: 1...60)
 
                           TextField("Подписи через запятую (OFFLINE, ONLINE)", text: $ed.blob.labels)
@@ -2253,15 +2931,39 @@ jobs:
                   }
               }
 
-              private func sliderRow(_ title: String, _ value: Binding<Double>, _ range: ClosedRange<Double>) -> some View {
-                  VStack(alignment: .leading, spacing: 2) {
-                      Text(title).font(.footnote)
-                      Slider(value: value, in: range)
+              // MARK: - Panel: trim
+
+              @ViewBuilder
+              private var trimBody: some View {
+                  if let i = ed.clips.firstIndex(where: { $0.id == ed.selectedClipID }) {
+                      HStack {
+                          Button { ed.move(i, -1) } label: { Image(systemName: "arrow.left") }
+                          Button { ed.move(i, 1) } label: { Image(systemName: "arrow.right") }
+                          Button {
+                              ed.toggleMuteSelected()
+                          } label: {
+                              Image(systemName: ed.clips[i].muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                          }
+                          Spacer()
+                          Button { ed.removeClip(ed.clips[i].id) } label: { Image(systemName: "trash") }
+                              .buttonStyle(ChipButtonStyle(danger: true))
+                      }
+                      .buttonStyle(ChipButtonStyle())
+
+                      valueSlider("Начало клипа", $ed.clips[i].inT,
+                                  0...max(0.1, ed.clips[i].outT - 0.2), format: "%.2f с") { ed.rebuild() }
+                      valueSlider("Конец клипа", $ed.clips[i].outT,
+                                  (ed.clips[i].inT + 0.2)...max(ed.clips[i].inT + 0.3, ed.clips[i].srcDur),
+                                  format: "%.2f с") { ed.rebuild() }
+                  } else {
+                      hint("Тапни по клипу на таймлайне, чтобы обрезать его, убрать звук или удалить.")
                   }
               }
 
-              private var audioTab: some View {
-                  VStack(alignment: .leading, spacing: 10) {
+              // MARK: - Panel: audio
+
+              private var audioBody: some View {
+                  VStack(alignment: .leading, spacing: 12) {
                       HStack {
                           Button { ed.muteAll(true) } label: {
                               Label("Убрать звук у видео", systemImage: "speaker.slash")
@@ -2270,45 +2972,41 @@ jobs:
                               Label("Вернуть", systemImage: "speaker.wave.2")
                           }
                       }
-                      .buttonStyle(.bordered)
-                      .font(.footnote)
+                      .buttonStyle(ChipButtonStyle())
+                      .disabled(ed.clips.isEmpty)
 
                       Button { showMusicPicker = true } label: {
                           Label(ed.music == nil ? "Добавить музыку" : "Заменить музыку", systemImage: "music.note")
                       }
-                      .buttonStyle(.borderedProminent)
+                      .buttonStyle(ChipButtonStyle(selected: true))
 
                       if let m = ed.music {
-                          Text(m.name).font(.footnote).foregroundStyle(.secondary)
+                          hint(m.name)
                           musicSlider("Громкость", \.volume, 0...1)
                           musicSlider("Фейд-ин, с", \.fadeIn, 0...5)
                           musicSlider("Фейд-аут, с", \.fadeOut, 0...5)
                           musicSlider("Старт на таймлайне, с", \.start, 0...max(0.1, ed.total))
                           musicSlider("Начать с секунды трека", \.inT, 0...max(0.1, m.dur - 1))
-                          Button("Убрать музыку", role: .destructive) {
+                          Button("Убрать музыку") {
                               ed.music = nil
                               ed.rebuild()
                           }
-                          .buttonStyle(.bordered)
+                          .buttonStyle(ChipButtonStyle(danger: true))
                       }
                   }
               }
 
               private func musicSlider(_ title: String, _ kp: WritableKeyPath<Music, Double>,
                                        _ range: ClosedRange<Double>) -> some View {
-                  VStack(alignment: .leading, spacing: 2) {
-                      Text("\(title): \(String(format: "%.1f", ed.music?[keyPath: kp] ?? 0))").font(.footnote)
-                      Slider(
-                          value: Binding(
-                              get: { ed.music?[keyPath: kp] ?? 0 },
-                              set: { ed.music?[keyPath: kp] = $0 }
-                          ),
-                          in: range,
-                          onEditingChanged: { editing in
-                              if !editing { ed.rebuild() }
-                          }
-                      )
-                  }
+                  valueSlider(
+                      title,
+                      Binding(
+                          get: { ed.music?[keyPath: kp] ?? 0 },
+                          set: { ed.music?[keyPath: kp] = $0 }
+                      ),
+                      range,
+                      format: "%.1f"
+                  ) { ed.rebuild() }
               }
           }
 
