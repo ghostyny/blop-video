@@ -751,6 +751,12 @@ jobs:
               var width = 4.0        // толщина линии
               var variants = 4       // сколько разных рисунков чередуется (0 = без повторов)
               var twin = true        // вторая тонкая линия поверх первой
+              var angleV: Double? = nil   // поворот стрелки в градусах (nil в старых проектах)
+              /// 0 = вверх, положительные значения = по часовой стрелке.
+              var angle: Double {
+                  get { angleV ?? 0 }
+                  set { angleV = newValue }
+              }
           }
 
           struct ShapeSpec {
@@ -900,13 +906,19 @@ jobs:
                   let hw = Double(r.width) / 2
                   let hh = Double(r.height) / 2
                   let passes = st.twin ? 2 : 1
+                  // Поворот есть только у стрелки. Ноль = как раньше (вверх, растянута под рамку).
+                  // С углом стрелка рисуется пропорционально и целиком помещается в рамку.
+                  let ang = spec.shape == .arrow ? st.angle : 0
+                  let baseRot = -ang * Double.pi / 180
+                  let sx = (spec.shape == .arrow && ang != 0) ? min(hw, hh) : hw
+                  let sy = (spec.shape == .arrow && ang != 0) ? min(hw, hh) : hh
 
                   for p in 0..<passes {
                       var rg = HandRNG(frame &* 7919 &+ spec.seed &* 104729 &+ p &* 31337 &+ 1)
                       let scl = 1.08 * (1 + (rg.next() - 0.5) * j * 0.16)
                       let tx = (rg.next() - 0.5) * j * 0.06 * Double(r.width)
                       let ty = (rg.next() - 0.5) * j * 0.06 * Double(r.height)
-                      let rot = (rg.next() - 0.5) * j * 0.3
+                      let rot = (rg.next() - 0.5) * j * 0.3 + baseRot
                       let wv = 0.7 + rg.next() * 0.6
 
                       var strokes: [[Pt]] = []
@@ -929,8 +941,8 @@ jobs:
                       for s in strokes {
                           var pts: [CGPoint] = []
                           for q in s {
-                              let u = q.x * hw * scl
-                              let v = -q.y * hh * scl
+                              let u = q.x * sx * scl
+                              let v = -q.y * sy * scl
                               pts.append(CGPoint(x: cx + tx + u * cr - v * sr, y: cy + ty + u * sr + v * cr))
                           }
                           addPath(ctx, pts)
@@ -2542,8 +2554,8 @@ jobs:
 
               func deleteBox(_ id: UUID) {
                   let hadBeep = boxes.first(where: { $0.id == id })?.fx.has(.beep) ?? false
+                  if selectedBoxID == id { selectedBoxID = nil }   // сначала убираем панель, потом данные
                   boxes.removeAll { $0.id == id }
-                  if selectedBoxID == id { selectedBoxID = nil }
                   if hadBeep { rebuild() }
               }
 
@@ -3702,6 +3714,32 @@ jobs:
                   }
               }
 
+              // MARK: - Безопасные биндинги по id
+              // Индекс в массиве после удаления устаревает, а SwiftUI ещё читает старые биндинги.
+              // Поэтому ищем элемент по id при каждом обращении, а если его уже нет, отдаём запасное значение.
+
+              private func boxBinding<T>(_ id: UUID, _ kp: WritableKeyPath<Box, T>, _ fallback: T) -> Binding<T> {
+                  Binding(
+                      get: { ed.boxes.first(where: { $0.id == id })?[keyPath: kp] ?? fallback },
+                      set: { v in
+                          if let i = ed.boxes.firstIndex(where: { $0.id == id }) { ed.boxes[i][keyPath: kp] = v }
+                      }
+                  )
+              }
+
+              private func clipBinding<T>(_ id: UUID, _ kp: WritableKeyPath<Clip, T>, _ fallback: T) -> Binding<T> {
+                  Binding(
+                      get: { ed.clips.first(where: { $0.id == id })?[keyPath: kp] ?? fallback },
+                      set: { v in
+                          if let i = ed.clips.firstIndex(where: { $0.id == id }) { ed.clips[i][keyPath: kp] = v }
+                      }
+                  )
+              }
+
+              private func mutateBox(_ id: UUID, _ f: (inout Box) -> Void) {
+                  if let i = ed.boxes.firstIndex(where: { $0.id == id }) { f(&ed.boxes[i]) }
+              }
+
               // MARK: - Panel: boxes
 
               private var boxesBody: some View {
@@ -3763,16 +3801,16 @@ jobs:
                           Spacer(minLength: 0)
                       }
 
-                      if let i = ed.boxes.firstIndex(where: { $0.id == ed.selectedBoxID }) {
+                      if let id = ed.boxes.first(where: { $0.id == ed.selectedBoxID })?.id {
                           Picker("", selection: $boxTab) {
                               ForEach(BoxTab.allCases) { Text($0.rawValue).tag($0) }
                           }
                           .pickerStyle(.segmented)
 
                           switch boxTab {
-                          case .look: lookBody(i)
-                          case .fx: fxBody(i)
-                          case .time: timeBody(i)
+                          case .look: lookBody(id)
+                          case .fx: fxBody(id)
+                          case .time: timeBody(id)
                           }
                       } else {
                           hint("Нарисуй рамку пальцем на кадре, трекинг пойдёт от этого момента. Потом выбери её здесь: подпись и цвет на вкладке «Вид», анимации на вкладке «Эффекты», начало и конец на вкладке «Время».")
@@ -3781,41 +3819,39 @@ jobs:
               }
 
               @ViewBuilder
-              private func lookBody(_ i: Int) -> some View {
-                  let id = ed.boxes[i].id
-                  TextField("Подпись (например: do you see him too?)", text: $ed.boxes[i].label)
-                      .textFieldStyle(.roundedBorder)
+              private func lookBody(_ id: UUID) -> some View {
+                  if let box = ed.boxes.first(where: { $0.id == id }) {
+                      TextField("Подпись (например: do you see him too?)", text: boxBinding(id, \.label, ""))
+                          .textFieldStyle(.roundedBorder)
 
-                  HStack {
-                      Button("OFFLINE") {
-                          ed.boxes[i].label = "OFFLINE"
-                          ed.boxes[i].color = .red
-                          ed.boxes[i].textColor = .red
+                      HStack {
+                          Button("OFFLINE") {
+                              mutateBox(id) { $0.label = "OFFLINE"; $0.color = .red; $0.textColor = .red }
+                          }
+                          Button("ONLINE") {
+                              mutateBox(id) { $0.label = "ONLINE"; $0.color = .green; $0.textColor = .green }
+                          }
+                          Spacer()
+                          Button("Удалить") { ed.deleteBox(id) }
+                              .buttonStyle(ChipButtonStyle(danger: true))
                       }
-                      Button("ONLINE") {
-                          ed.boxes[i].label = "ONLINE"
-                          ed.boxes[i].color = .green
-                          ed.boxes[i].textColor = .green
-                      }
-                      Spacer()
-                      Button("Удалить") { ed.deleteBox(id) }
-                          .buttonStyle(ChipButtonStyle(danger: true))
-                  }
-                  .buttonStyle(ChipButtonStyle())
+                      .buttonStyle(ChipButtonStyle())
 
-                  ColorRow(title: "Цвет рамки", selection: $ed.boxes[i].color)
-                  ColorRow(title: "Цвет текста", selection: $ed.boxes[i].textColor)
-                  shapeControls(shape: $ed.boxes[i].shape, hand: $ed.boxes[i].hand, color: ed.boxes[i].color)
-                  if ed.boxes.count > 1 {
-                      Button("Форму и стиль всем рамкам") { ed.applyShapeToAll(from: id) }
-                          .buttonStyle(ChipButtonStyle())
+                      ColorRow(title: "Цвет рамки", selection: boxBinding(id, \.color, RGB.red))
+                      ColorRow(title: "Цвет текста", selection: boxBinding(id, \.textColor, RGB.red))
+                      shapeControls(shape: boxBinding(id, \.shape, BoxShape.rect),
+                                    hand: boxBinding(id, \.hand, HandStyle()),
+                                    color: box.color)
+                      if ed.boxes.count > 1 {
+                          Button("Форму и стиль всем рамкам") { ed.applyShapeToAll(from: id) }
+                              .buttonStyle(ChipButtonStyle())
+                      }
                   }
               }
 
               @ViewBuilder
-              private func fxBody(_ i: Int) -> some View {
-                  let id = ed.boxes[i].id
-                  let on = ed.boxes[i].fx.on
+              private func fxBody(_ id: UUID) -> some View {
+                  let on = ed.boxes.first(where: { $0.id == id })?.fx.on ?? []
                   HStack {
                       Button("Пакет из 5") { ed.setFX(id, BoxFX.pack) }
                       Button("Сбросить") { ed.setFX(id, []) }
@@ -3832,10 +3868,11 @@ jobs:
               }
 
               @ViewBuilder
-              private func timeBody(_ i: Int) -> some View {
-                  let id = ed.boxes[i].id
-                  let startTxt = String(format: "%.2f", ed.boxes[i].startT)
-                  let endTxt = ed.boxes[i].hideAfter.map { String(format: "%.2f с", $0) } ?? "нет"
+              private func timeBody(_ id: UUID) -> some View {
+                  let b = ed.boxes.first(where: { $0.id == id })
+                  let hide: Double? = b?.hideAfter
+                  let startTxt = String(format: "%.2f", b?.startT ?? 0)
+                  let endTxt = hide.map { String(format: "%.2f с", $0) } ?? "нет"
                   hint("Поставь курсор на нужный кадр и нажми кнопку. Сейчас: начало \(startTxt) с, конец \(endTxt).")
                   HStack {
                       Button("Начало тут") { ed.setStartHere(id) }
@@ -3895,6 +3932,18 @@ jobs:
                               .frame(height: 120)
                               .frame(maxWidth: .infinity)
                               .background(Theme.tile, in: RoundedRectangle(cornerRadius: 12))
+                          if shape.wrappedValue == .arrow {
+                              valueSlider("Поворот стрелки",
+                                          Binding(get: { hand.wrappedValue.angle }, set: { hand.wrappedValue.angle = $0 }),
+                                          -180...180, format: "%.0f°")
+                              HStack {
+                                  ForEach([(0.0, "↑"), (90.0, "→"), (180.0, "↓"), (-90.0, "←")], id: \.0) { a in
+                                      Button(a.1) { hand.wrappedValue.angle = a.0 }
+                                          .buttonStyle(ChipButtonStyle(selected: hand.wrappedValue.angle == a.0))
+                                  }
+                                  Spacer(minLength: 0)
+                              }
+                          }
                           valueSlider("Кадров в секунду",
                                       Binding(get: { hand.wrappedValue.fps }, set: { hand.wrappedValue.fps = $0 }),
                                       3...24, format: "%.0f")
@@ -3970,25 +4019,27 @@ jobs:
 
               @ViewBuilder
               private var trimBody: some View {
-                  if let i = ed.clips.firstIndex(where: { $0.id == ed.selectedClipID }) {
+                  if let clip = ed.clips.first(where: { $0.id == ed.selectedClipID }),
+                     let i = ed.clips.firstIndex(where: { $0.id == clip.id }) {
+                      let cid = clip.id
                       HStack {
                           Button { ed.move(i, -1) } label: { Image(systemName: "arrow.left") }
                           Button { ed.move(i, 1) } label: { Image(systemName: "arrow.right") }
                           Button {
                               ed.toggleMuteSelected()
                           } label: {
-                              Image(systemName: ed.clips[i].muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                              Image(systemName: clip.muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
                           }
                           Spacer()
-                          Button { ed.removeClip(ed.clips[i].id) } label: { Image(systemName: "trash") }
+                          Button { ed.removeClip(cid) } label: { Image(systemName: "trash") }
                               .buttonStyle(ChipButtonStyle(danger: true))
                       }
                       .buttonStyle(ChipButtonStyle())
 
-                      valueSlider("Начало клипа", $ed.clips[i].inT,
-                                  0...max(0.1, ed.clips[i].outT - 0.2), format: "%.2f с") { ed.rebuild() }
-                      valueSlider("Конец клипа", $ed.clips[i].outT,
-                                  (ed.clips[i].inT + 0.2)...max(ed.clips[i].inT + 0.3, ed.clips[i].srcDur),
+                      valueSlider("Начало клипа", clipBinding(cid, \.inT, 0.0),
+                                  0...max(0.1, clip.outT - 0.2), format: "%.2f с") { ed.rebuild() }
+                      valueSlider("Конец клипа", clipBinding(cid, \.outT, 0.0),
+                                  (clip.inT + 0.2)...max(clip.inT + 0.3, clip.srcDur),
                                   format: "%.2f с") { ed.rebuild() }
                   } else {
                       hint("Тапни по клипу на таймлайне, чтобы обрезать его, убрать звук или удалить.")
