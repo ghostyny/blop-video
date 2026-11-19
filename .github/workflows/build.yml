@@ -197,6 +197,16 @@ jobs:
               var textColor: RGB = .red
               var samples: [Sample] = []
               var fxv: BoxFX? = nil      // эффекты (nil в старых проектах)
+              var shapev: BoxShape? = nil   // форма (nil = обычная рамка)
+              var shape: BoxShape {
+                  get { shapev ?? .rect }
+                  set { shapev = newValue }
+              }
+              var handv: HandStyle? = nil   // настройки рисованной дрожи
+              var hand: HandStyle {
+                  get { handv ?? HandStyle() }
+                  set { handv = newValue }
+              }
               var fx: BoxFX {
                   get { fxv ?? BoxFX() }
                   set { fxv = newValue }
@@ -318,7 +328,7 @@ jobs:
 
                       out.append(DrawItem(rect: rect, label: b.label, color: b.color, textColor: b.textColor, seed: i,
                                           fx: b.fx, age: l.src - b.startT, rem: endT - l.src, trail: tr,
-                                          selected: b.id == selected))
+                                          selected: b.id == selected, shape: b.shape, hand: b.hand))
                   }
                   return out
               }
@@ -329,7 +339,7 @@ jobs:
                   for (k, r) in rects.enumerated() {
                       let text = labels.isEmpty ? "" : labels[k % labels.count]
                       out.append(DrawItem(rect: r, label: text, color: s.color, textColor: s.textColor, seed: k,
-                                          fx: s.fx, age: time + 5))
+                                          fx: s.fx, age: time + 5, shape: s.shape, hand: s.hand))
                   }
                   return out
               }
@@ -554,6 +564,16 @@ jobs:
               var color: RGB = .red          // box color
               var textColor: RGB = .red      // label color
               var fxv: BoxFX? = nil          // effects (nil in old projects)
+              var shapev: BoxShape? = nil    // shape (nil = plain frame)
+              var shape: BoxShape {
+                  get { shapev ?? .rect }
+                  set { shapev = newValue }
+              }
+              var handv: HandStyle? = nil
+              var hand: HandStyle {
+                  get { handv ?? HandStyle() }
+                  set { handv = newValue }
+              }
               var fx: BoxFX {
                   get { fxv ?? BoxFX() }
                   set { fxv = newValue }
@@ -710,6 +730,239 @@ jobs:
               }
           }
           __BT_END__
+          cat > Sources/Hand.swift <<'__BT_END__'
+          import SwiftUI
+          import CoreGraphics
+
+          /// Форма вместо обычной рамки. Рисуется в тех же границах, что и рамка.
+          enum BoxShape: String, CaseIterable, Codable, Identifiable {
+              case rect = "Рамка"
+              case circle = "Круг"
+              case heart = "Сердце"
+              case arrow = "Стрелка"
+              case cross = "Крест"
+              var id: String { rawValue }
+          }
+
+          /// Настройки «рисованной» дрожи: те же, что в HTML-превью.
+          struct HandStyle: Codable, Equatable {
+              var fps = 10.0         // сколько раз в секунду форма перерисовывается
+              var jitter = 0.9       // насколько криво
+              var width = 4.0        // толщина линии
+              var variants = 4       // сколько разных рисунков чередуется (0 = без повторов)
+              var twin = true        // вторая тонкая линия поверх первой
+          }
+
+          struct ShapeSpec {
+              var shape: BoxShape
+              var style: HandStyle
+              var seed: Int
+          }
+
+          /// Детерминированный генератор: кадр зависит только от номера кадра и seed,
+          /// поэтому превью и готовое видео рисуют одно и то же.
+          struct HandRNG {
+              var s: UInt32
+              init(_ seed: Int) { s = UInt32(truncatingIfNeeded: seed) }
+              mutating func next() -> Double {
+                  s = s &+ 0x6D2B79F5
+                  var t = (s ^ (s >> 15)) &* (1 | s)
+                  t = (t &+ ((t ^ (t >> 7)) &* (61 | t))) ^ t
+                  return Double(t ^ (t >> 14)) / 4294967296.0
+              }
+          }
+
+          enum Hand {
+              typealias Pt = (x: Double, y: Double)
+
+              /// Штрих по опорным точкам: сдвиг точек, изгиб, волна и выход за концы.
+              static func stroke(_ ctrl: [Pt], _ r: inout HandRNG, _ j: Double, _ ov: Double) -> [Pt] {
+                  var c: [Pt] = []
+                  for p in ctrl {
+                      let dx = (r.next() - 0.5) * j * 0.25
+                      let dy = (r.next() - 0.5) * j * 0.25
+                      c.append((x: p.x + dx, y: p.y + dy))
+                  }
+                  if ov > 0 && c.count >= 2 {
+                      let a = c[0]
+                      let b = c[1]
+                      let e = c[c.count - 1]
+                      let d = c[c.count - 2]
+                      let la = max(0.0001, hypot(b.x - a.x, b.y - a.y))
+                      let le = max(0.0001, hypot(e.x - d.x, e.y - d.y))
+                      let o1 = r.next() * ov * j
+                      let o2 = r.next() * ov * j
+                      c[0] = (x: a.x - (b.x - a.x) / la * o1, y: a.y - (b.y - a.y) / la * o1)
+                      c[c.count - 1] = (x: e.x + (e.x - d.x) / le * o2, y: e.y + (e.y - d.y) / le * o2)
+                  }
+                  var out: [Pt] = []
+                  for i in 0..<(c.count - 1) {
+                      let a = c[i]
+                      let b = c[i + 1]
+                      let dx = b.x - a.x
+                      let dy = b.y - a.y
+                      let len = max(0.0001, hypot(dx, dy))
+                      let nx = -dy / len
+                      let ny = dx / len
+                      let bend = (r.next() - 0.5) * 0.3 * j * len
+                      let n = max(4, Int((len * 8).rounded()))
+                      let ph = r.next() * 6.283
+                      let wf = 5 + r.next() * 5
+                      let from = (i == 0) ? 0 : 1
+                      for k in from...n {
+                          let u = Double(k) / Double(n)
+                          let o = sin(Double.pi * u) * bend + sin(u * wf + ph) * 0.035 * j
+                          out.append((x: a.x + dx * u + nx * o, y: a.y + dy * u + ny * o))
+                      }
+                  }
+                  return out
+              }
+
+              static func circle(_ r: inout HandRNG, _ j: Double) -> [[Pt]] {
+                  let a0 = r.next() * 6.283
+                  let sw = 6.283 * (1.02 + r.next() * 0.2 * (0.4 + j))
+                  let ph0 = r.next() * 6.283
+                  let ph1 = r.next() * 6.283
+                  let dr = (r.next() - 0.5) * 0.3 * (0.3 + j)
+                  let sq = 1 + (r.next() - 0.5) * 0.22 * j
+                  let n = 56
+                  var p: [Pt] = []
+                  for i in 0...n {
+                      let u = Double(i) / Double(n)
+                      let a = a0 + sw * u
+                      let wob = sin(2 * a + ph0) + 0.7 * sin(3 * a + ph1)
+                      let rad = 0.76 * (1 + j * 0.1 * wob) + u * dr
+                      p.append((x: cos(a) * rad * sq, y: sin(a) * rad))
+                  }
+                  return [p]
+              }
+
+              static func heart(_ r: inout HandRNG, _ j: Double) -> [[Pt]] {
+                  let t0 = Double.pi + (r.next() - 0.5) * 0.7
+                  let sw = 6.283 * (1.02 + r.next() * 0.12 * (0.4 + j))
+                  let ph0 = r.next() * 6.283
+                  let ph1 = r.next() * 6.283
+                  let sk = (r.next() - 0.5) * 0.3 * j
+                  let n = 80
+                  var p: [Pt] = []
+                  for i in 0...n {
+                      let u = Double(i) / Double(n)
+                      let t = t0 + sw * u
+                      let w = 1 + j * 0.08 * sin(2 * t + ph0) + j * 0.05 * sin(5 * t + ph1)
+                      let s = sin(t)
+                      let x = 16 * s * s * s / 18
+                      let c1 = 13 * cos(t) - 5 * cos(2 * t)
+                      let c2 = 2 * cos(3 * t) + cos(4 * t)
+                      let y = -(c1 - c2) / 18 - 0.135
+                      p.append((x: x * w * 0.88 + sk * y * 0.6, y: y * w * 0.88))
+                  }
+                  return [p]
+              }
+
+              static func arrow(_ r: inout HandRNG, _ j: Double) -> [[Pt]] {
+                  let shaft: [Pt] = [(x: 0.0, y: 0.85), (x: 0.0, y: -0.85)]
+                  let head: [Pt] = [(x: -0.46, y: -0.38), (x: 0.0, y: -0.92), (x: 0.46, y: -0.38)]
+                  let s1 = stroke(shaft, &r, j, 0.3)
+                  let s2 = stroke(head, &r, j, 0.18)
+                  return [s1, s2]
+              }
+
+              static func cross(_ r: inout HandRNG, _ j: Double) -> [[Pt]] {
+                  let l1: [Pt] = [(x: -0.72, y: -0.72), (x: 0.72, y: 0.72)]
+                  let l2: [Pt] = [(x: 0.72, y: -0.72), (x: -0.72, y: 0.72)]
+                  let s1 = stroke(l1, &r, j, 0.3)
+                  let s2 = stroke(l2, &r, j, 0.3)
+                  return [s1, s2]
+              }
+
+              private static func addPath(_ ctx: CGContext, _ p: [CGPoint]) {
+                  guard p.count > 1 else { return }
+                  ctx.beginPath()
+                  ctx.move(to: p[0])
+                  if p.count > 2 {
+                      for i in 1..<(p.count - 1) {
+                          let m = CGPoint(x: (p[i].x + p[i + 1].x) / 2, y: (p[i].y + p[i + 1].y) / 2)
+                          ctx.addQuadCurve(to: m, control: p[i])
+                      }
+                  }
+                  ctx.addLine(to: p[p.count - 1])
+                  ctx.strokePath()
+              }
+
+              /// Рисует форму в прямоугольнике r (начало координат слева снизу).
+              static func draw(_ ctx: CGContext, _ r: CGRect, spec: ShapeSpec, color: CGColor, time: Double, k: CGFloat) {
+                  let st = spec.style
+                  let step = Int(floor(max(0, time) * max(1, st.fps)))
+                  let frame = st.variants > 0 ? step % st.variants : step
+                  let j = st.jitter
+                  let cx = Double(r.midX)
+                  let cy = Double(r.midY)
+                  let hw = Double(r.width) / 2
+                  let hh = Double(r.height) / 2
+                  let passes = st.twin ? 2 : 1
+
+                  for p in 0..<passes {
+                      var rg = HandRNG(frame &* 7919 &+ spec.seed &* 104729 &+ p &* 31337 &+ 1)
+                      let scl = 1.08 * (1 + (rg.next() - 0.5) * j * 0.16)
+                      let tx = (rg.next() - 0.5) * j * 0.06 * Double(r.width)
+                      let ty = (rg.next() - 0.5) * j * 0.06 * Double(r.height)
+                      let rot = (rg.next() - 0.5) * j * 0.3
+                      let wv = 0.7 + rg.next() * 0.6
+
+                      var strokes: [[Pt]] = []
+                      switch spec.shape {
+                      case .circle: strokes = circle(&rg, j)
+                      case .heart: strokes = heart(&rg, j)
+                      case .arrow: strokes = arrow(&rg, j)
+                      case .cross: strokes = cross(&rg, j)
+                      case .rect: strokes = []
+                      }
+
+                      let cr = cos(rot)
+                      let sr = sin(rot)
+                      ctx.saveGState()
+                      ctx.setStrokeColor(color)
+                      ctx.setLineCap(.round)
+                      ctx.setLineJoin(.round)
+                      ctx.setAlpha(p == 0 ? 1.0 : 0.55)
+                      ctx.setLineWidth(CGFloat(st.width * wv * (p == 0 ? 1.0 : 0.7)) * k)
+                      for s in strokes {
+                          var pts: [CGPoint] = []
+                          for q in s {
+                              let u = q.x * hw * scl
+                              let v = -q.y * hh * scl
+                              pts.append(CGPoint(x: cx + tx + u * cr - v * sr, y: cy + ty + u * sr + v * cr))
+                          }
+                          addPath(ctx, pts)
+                      }
+                      ctx.restoreGState()
+                  }
+              }
+          }
+
+          /// Живое мини-превью в панели: показывает дрожь, даже когда видео стоит на паузе.
+          struct HandPreview: View {
+              let shape: BoxShape
+              let style: HandStyle
+              let color: RGB
+
+              var body: some View {
+                  TimelineView(.animation) { tl in
+                      Canvas { gc, size in
+                          let t = tl.date.timeIntervalSinceReferenceDate
+                          gc.withCGContext { cg in
+                              cg.translateBy(x: 0, y: size.height)
+                              cg.scaleBy(x: 1, y: -1)
+                              let w = min(size.width, size.height) * 0.7
+                              let r = CGRect(x: (size.width - w) / 2, y: (size.height - w) / 2, width: w, height: w)
+                              let spec = ShapeSpec(shape: shape, style: style, seed: 3)
+                              Hand.draw(cg, r, spec: spec, color: color.cg, time: t, k: 1)
+                          }
+                      }
+                  }
+              }
+          }
+          __BT_END__
           cat > Sources/Processor.swift <<'__BT_END__'
           import AVFoundation
           import Vision
@@ -741,6 +994,9 @@ jobs:
               var rem = 100.0       // сколько секунд ей осталось
               var trail: [CGRect] = []   // прошлые положения для шлейфа (normalized)
               var selected = false
+              var shape: BoxShape = .rect
+              var hand = HandStyle()
+              var spec: ShapeSpec? { shape == .rect ? nil : ShapeSpec(shape: shape, style: hand, seed: seed) }
           }
 
           private func sec(_ s: Double) -> CMTime {
@@ -1174,7 +1430,12 @@ jobs:
               }
 
               static func strokeFrame(_ ctx: CGContext, _ r: CGRect, color: CGColor, lw: CGFloat,
-                                      brackets: Bool, dashed: Bool, time: Double, k: CGFloat) {
+                                      brackets: Bool, dashed: Bool, time: Double, k: CGFloat,
+                                      spec: ShapeSpec? = nil) {
+                  if let sp = spec {
+                      Hand.draw(ctx, r, spec: sp, color: color, time: time, k: k)
+                      return
+                  }
                   ctx.saveGState()
                   ctx.setStrokeColor(color)
                   ctx.setLineWidth(lw)
@@ -1209,7 +1470,8 @@ jobs:
                   ctx.saveGState()
                   ctx.setShadow(offset: .zero, blur: lw * 3, color: col(it.color, al))
                   strokeFrame(ctx, r, color: col(it.color, al), lw: lw,
-                              brackets: it.fx.has(.brackets), dashed: it.fx.has(.dashed), time: time, k: k)
+                              brackets: it.fx.has(.brackets), dashed: it.fx.has(.dashed), time: time, k: k,
+                              spec: it.spec)
                   ctx.restoreGState()
               }
 
@@ -1365,7 +1627,7 @@ jobs:
                               let tr2 = CGRect(x: tr.minX * W, y: tr.minY * H, width: tr.width * W, height: tr.height * H)
                               let a = min(1, 0.55 / CGFloat(n + 1)) * al
                               strokeFrame(ctx, tr2, color: col(it.color, a), lw: lineW,
-                                          brackets: fx.has(.brackets), dashed: false, time: time, k: k)
+                                          brackets: fx.has(.brackets), dashed: false, time: time, k: k, spec: it.spec)
                           }
                       }
 
@@ -1405,9 +1667,11 @@ jobs:
                           let ox = CGFloat(j - 0.5) * 9 * k
                           let oy = CGFloat(j2 - 0.5) * 5 * k
                           strokeFrame(ctx, r.offsetBy(dx: ox, dy: oy), color: col(RGB(1.0, 0.16, 0.23), 0.85 * al),
-                                      lw: lineW, brackets: fx.has(.brackets), dashed: fx.has(.dashed), time: time, k: k)
+                                      lw: lineW, brackets: fx.has(.brackets), dashed: fx.has(.dashed), time: time, k: k,
+                                      spec: it.spec)
                           strokeFrame(ctx, r.offsetBy(dx: -ox, dy: -oy), color: col(RGB(0.16, 0.42, 1.0), 0.85 * al),
-                                      lw: lineW, brackets: fx.has(.brackets), dashed: fx.has(.dashed), time: time, k: k)
+                                      lw: lineW, brackets: fx.has(.brackets), dashed: fx.has(.dashed), time: time, k: k,
+                                      spec: it.spec)
                           if rnd(Int(time * 12), seed + 5) > 0.1 {
                               glowFrame(ctx, r, it, lineW, al, time, k)
                           }
@@ -2357,6 +2621,14 @@ jobs:
                   guard let src = boxes.first(where: { $0.id == id }) else { return }
                   for i in boxes.indices { boxes[i].fx = src.fx }
                   rebuild()
+              }
+
+              func applyShapeToAll(from id: UUID) {
+                  guard let b = boxes.first(where: { $0.id == id }) else { return }
+                  for i in boxes.indices {
+                      boxes[i].shape = b.shape
+                      boxes[i].hand = b.hand
+                  }
               }
 
               // MARK: - Blobs
@@ -3533,6 +3805,11 @@ jobs:
 
                   ColorRow(title: "Цвет рамки", selection: $ed.boxes[i].color)
                   ColorRow(title: "Цвет текста", selection: $ed.boxes[i].textColor)
+                  shapeControls(shape: $ed.boxes[i].shape, hand: $ed.boxes[i].hand, color: ed.boxes[i].color)
+                  if ed.boxes.count > 1 {
+                      Button("Форму и стиль всем рамкам") { ed.applyShapeToAll(from: id) }
+                          .buttonStyle(ChipButtonStyle())
+                  }
               }
 
               @ViewBuilder
@@ -3600,6 +3877,48 @@ jobs:
                   }
               }
 
+              // MARK: - Shape controls (форма и рисованная дрожь)
+
+              private func shapeControls(shape: Binding<BoxShape>, hand: Binding<HandStyle>, color: RGB) -> some View {
+                  VStack(alignment: .leading, spacing: 10) {
+                      Text("Форма").font(.footnote)
+                      ScrollView(.horizontal, showsIndicators: false) {
+                          HStack {
+                              ForEach(BoxShape.allCases) { s in
+                                  Button(s.rawValue) { shape.wrappedValue = s }
+                                      .buttonStyle(ChipButtonStyle(selected: shape.wrappedValue == s))
+                              }
+                          }
+                      }
+                      if shape.wrappedValue != .rect {
+                          HandPreview(shape: shape.wrappedValue, style: hand.wrappedValue, color: color)
+                              .frame(height: 120)
+                              .frame(maxWidth: .infinity)
+                              .background(Theme.tile, in: RoundedRectangle(cornerRadius: 12))
+                          valueSlider("Кадров в секунду",
+                                      Binding(get: { hand.wrappedValue.fps }, set: { hand.wrappedValue.fps = $0 }),
+                                      3...24, format: "%.0f")
+                          valueSlider("Дрожание",
+                                      Binding(get: { hand.wrappedValue.jitter }, set: { hand.wrappedValue.jitter = $0 }),
+                                      0...1.5)
+                          valueSlider("Толщина",
+                                      Binding(get: { hand.wrappedValue.width }, set: { hand.wrappedValue.width = $0 }),
+                                      1...12, format: "%.1f")
+                          Text("Вариантов кадров (∞ = без повторов)").font(.footnote)
+                          Picker("", selection: Binding(get: { hand.wrappedValue.variants },
+                                                        set: { hand.wrappedValue.variants = $0 })) {
+                              ForEach([2, 3, 4, 6, 0], id: \.self) { n in
+                                  Text(n == 0 ? "∞" : "\(n)").tag(n)
+                              }
+                          }
+                          .pickerStyle(.segmented)
+                          Toggle("Двойная линия",
+                                 isOn: Binding(get: { hand.wrappedValue.twin }, set: { hand.wrappedValue.twin = $0 }))
+                          hint("Цвет формы это «Цвет рамки». На видео дрожь видна при воспроизведении, а здесь она идёт всегда.")
+                      }
+                  }
+              }
+
               // MARK: - Panel: blobs
 
               private var blobsBody: some View {
@@ -3634,6 +3953,7 @@ jobs:
 
                           ColorRow(title: "Цвет рамок", selection: $ed.blob.color)
                           ColorRow(title: "Цвет текста", selection: $ed.blob.textColor)
+                          shapeControls(shape: $ed.blob.shape, hand: $ed.blob.hand, color: ed.blob.color)
 
                           DisclosureGroup("Эффекты рамок", isExpanded: $blobFXOpen) {
                               fxGroups(FXKind.blobKinds, on: ed.blob.fx.on) { k in
