@@ -1,0 +1,1191 @@
+# BlobTracker: весь проект в одном файле.
+# Положи этот файл в репозиторий по пути .github/workflows/build.yml
+# Сборка стартует сама после коммита. Готовый .ipa появится в разделе Releases.
+name: Build IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write project files
+        run: |
+          mkdir -p Sources
+          cat > project.yml <<'__BT_END__'
+          name: BlobTracker
+          options:
+            bundleIdPrefix: com.blobtracker
+            deploymentTarget:
+              iOS: "17.0"
+          targets:
+            BlobTracker:
+              type: application
+              platform: iOS
+              sources:
+                - path: Sources
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.blobtracker.app
+                  PRODUCT_NAME: BlobTracker
+                  SWIFT_VERSION: "5.0"
+                  GENERATE_INFOPLIST_FILE: YES
+                  INFOPLIST_KEY_CFBundleDisplayName: BlobTracker
+                  INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: "Сохранить готовое видео в галерею"
+                  INFOPLIST_KEY_UILaunchScreen_Generation: YES
+                  INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+                  MARKETING_VERSION: "1.0"
+                  CURRENT_PROJECT_VERSION: "1"
+                  TARGETED_DEVICE_FAMILY: "1"
+                  CODE_SIGNING_ALLOWED: NO
+          __BT_END__
+          cat > Sources/App.swift <<'__BT_END__'
+          import SwiftUI
+
+          @main
+          struct BlobTrackerApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                          .preferredColorScheme(.dark)
+                  }
+              }
+          }
+          __BT_END__
+          cat > Sources/Models.swift <<'__BT_END__'
+          import SwiftUI
+          import UIKit
+          import CoreTransferable
+          import UniformTypeIdentifiers
+
+          /// Любой цвет (для рамки и для текста).
+          struct RGB: Equatable, Hashable {
+              var r: Double
+              var g: Double
+              var b: Double
+
+              init(_ r: Double, _ g: Double, _ b: Double) {
+                  self.r = r
+                  self.g = g
+                  self.b = b
+              }
+
+              init(color: Color) {
+                  var rr: CGFloat = 0, gg: CGFloat = 0, bb: CGFloat = 0, aa: CGFloat = 0
+                  UIColor(color).getRed(&rr, green: &gg, blue: &bb, alpha: &aa)
+                  self.init(Double(rr), Double(gg), Double(bb))
+              }
+
+              static let red = RGB(1.0, 0.05, 0.05)
+              static let green = RGB(0.1, 1.0, 0.1)
+              static let blue = RGB(0.25, 0.45, 1.0)
+              static let yellow = RGB(1.0, 0.9, 0.0)
+              static let white = RGB(1.0, 1.0, 1.0)
+              static let cyan = RGB(0.0, 0.95, 1.0)
+              static let magenta = RGB(1.0, 0.1, 0.8)
+              static let orange = RGB(1.0, 0.55, 0.0)
+
+              static let presets: [RGB] = [.red, .green, .blue, .yellow, .white, .cyan, .magenta, .orange]
+
+              var ui: Color { Color(red: r, green: g, blue: b) }
+              var cg: CGColor { CGColor(red: r, green: g, blue: b, alpha: 1) }
+          }
+
+          /// rect is normalized (0...1) with the origin at the BOTTOM-left, like Vision uses.
+          struct Box: Identifiable {
+              let id = UUID()
+              var rect: CGRect
+              var label = ""
+              var color: RGB = .red
+              var textColor: RGB = .red
+              var enabled = false
+          }
+
+          enum DetectMode: String, CaseIterable, Identifiable {
+              case rects = "Окна / прямоугольники"
+              case objects = "Объекты"
+              case people = "Люди"
+              case faces = "Лица"
+              case text = "Текст"
+              var id: String { rawValue }
+          }
+
+          /// Глюк-текст: всё строчными, а одна случайная буква заглавная.
+          /// Буква меняется примерно раз в 0.5 сек (интервал слегка плавает 0.4...0.6).
+          /// Результат зависит только от времени и seed, поэтому в видео и в превью одинаковый ритм.
+          enum Glitch {
+              static let step = 0.5
+
+              private static func mix(_ a: Int, _ b: Int) -> UInt64 {
+                  var z = UInt64(truncatingIfNeeded: a) &* 0x9E3779B97F4A7C15
+                  z = z &+ UInt64(truncatingIfNeeded: b) &* 0xBF58476D1CE4E5B9
+                  z = z &+ 0x94D049BB133111EB
+                  z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+                  z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+                  return z ^ (z >> 31)
+              }
+
+              /// Граница k-го отрезка: k * 0.5 плюс сдвиг -0.05...+0.05 (длина отрезка 0.4...0.6).
+              private static func boundary(_ k: Int, _ seed: Int) -> Double {
+                  let j = Double(mix(k, seed &+ 7919) % 10000) / 10000.0
+                  return Double(k) * step + (j - 0.5) * 0.1
+              }
+
+              private static func base(_ k: Int, _ seed: Int, _ n: Int) -> Int {
+                  Int(mix(k, seed) % UInt64(n))
+              }
+
+              static func text(_ s: String, time t: Double, seed: Int) -> String {
+                  let chars = Array(s.lowercased())
+                  let letters = chars.indices.filter { chars[$0].isLetter }
+                  guard !letters.isEmpty else { return String(chars) }
+
+                  var k = Int(floor(t / step))
+                  if t < boundary(k, seed) {
+                      k -= 1
+                  } else if t >= boundary(k + 1, seed) {
+                      k += 1
+                  }
+
+                  let n = letters.count
+                  var pick = base(k, seed, n)
+                  if n > 1 {
+                      let prev = base(k - 1, seed, n)
+                      if pick == prev {
+                          pick = (pick + 1 + Int(mix(k, seed &+ 31) % UInt64(n - 1))) % n
+                      }
+                  }
+
+                  let target = letters[pick]
+                  var out = ""
+                  for (i, c) in chars.enumerated() {
+                      out += (i == target) ? String(c).uppercased() : String(c)
+                  }
+                  return out
+              }
+          }
+
+          struct VideoFile: Transferable {
+              let url: URL
+
+              static var transferRepresentation: some TransferRepresentation {
+                  FileRepresentation(contentType: .movie) { video in
+                      SentTransferredFile(video.url)
+                  } importing: { received in
+                      let dest = FileManager.default.temporaryDirectory
+                          .appendingPathComponent(UUID().uuidString + ".mov")
+                      try FileManager.default.copyItem(at: received.file, to: dest)
+                      return VideoFile(url: dest)
+                  }
+              }
+          }
+          __BT_END__
+          cat > Sources/Components.swift <<'__BT_END__'
+          import SwiftUI
+
+          /// Подпись в превью: тот же глюк, что потом будет в видео.
+          struct GlitchLabel: View {
+              let text: String
+              let color: RGB
+              let seed: Int
+
+              var body: some View {
+                  TimelineView(.periodic(from: .now, by: 0.1)) { tl in
+                      Text(Glitch.text(text, time: tl.date.timeIntervalSinceReferenceDate, seed: seed))
+                          .font(.system(size: 12, weight: .bold))
+                          .foregroundStyle(color.ui)
+                          .fixedSize()
+                  }
+              }
+          }
+
+          /// Быстрые цвета + любой свой через системную палитру.
+          struct ColorRow: View {
+              let title: String
+              @Binding var selection: RGB
+
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 6) {
+                      Text(title).font(.footnote)
+                      HStack(spacing: 8) {
+                          ForEach(RGB.presets, id: \.self) { c in
+                              Circle()
+                                  .fill(c.ui)
+                                  .frame(width: 26, height: 26)
+                                  .overlay(Circle().stroke(.white, lineWidth: selection == c ? 2 : 0))
+                                  .onTapGesture { selection = c }
+                          }
+                          Spacer(minLength: 0)
+                          ColorPicker(
+                              "",
+                              selection: Binding(
+                                  get: { selection.ui },
+                                  set: { selection = RGB(color: $0) }
+                              ),
+                              supportsOpacity: false
+                          )
+                          .labelsHidden()
+                      }
+                  }
+              }
+          }
+          __BT_END__
+          cat > Sources/Detector.swift <<'__BT_END__'
+          import Vision
+          import CoreGraphics
+
+          enum Detector {
+              /// Returns normalized rects (origin bottom-left) found on a single frame.
+              static func detect(_ image: CGImage, mode: DetectMode) -> [CGRect] {
+                  let handler = VNImageRequestHandler(cgImage: image, options: [:])
+
+                  switch mode {
+                  case .rects:
+                      let r = VNDetectRectanglesRequest()
+                      r.minimumAspectRatio = 0.15
+                      r.maximumObservations = 60
+                      r.minimumSize = 0.015
+                      r.minimumConfidence = 0.4
+                      r.quadratureTolerance = 25
+                      try? handler.perform([r])
+                      return (r.results ?? []).map { $0.boundingBox }
+
+                  case .objects:
+                      let r = VNGenerateObjectnessBasedSaliencyImageRequest()
+                      try? handler.perform([r])
+                      return (r.results?.first?.salientObjects ?? []).map { $0.boundingBox }
+
+                  case .people:
+                      let r = VNDetectHumanRectanglesRequest()
+                      r.upperBodyOnly = false
+                      try? handler.perform([r])
+                      return (r.results ?? []).map { $0.boundingBox }
+
+                  case .faces:
+                      let r = VNDetectFaceRectanglesRequest()
+                      try? handler.perform([r])
+                      return (r.results ?? []).map { $0.boundingBox }
+
+                  case .text:
+                      let r = VNRecognizeTextRequest()
+                      r.recognitionLevel = .fast
+                      try? handler.perform([r])
+                      return (r.results ?? []).map { $0.boundingBox }
+                  }
+              }
+          }
+          __BT_END__
+          cat > Sources/Blob.swift <<'__BT_END__'
+          import CoreGraphics
+          import CoreVideo
+          import Foundation
+
+          struct BlobSettings: Equatable {
+              enum Kind: String, CaseIterable, Identifiable {
+                  case color = "По цвету"
+                  case bright = "Светлое"
+                  case dark = "Тёмное"
+                  var id: String { rawValue }
+              }
+
+              var kind: Kind = .bright
+              var tr: Double = 1.0
+              var tg: Double = 0.8
+              var tb: Double = 0.2
+              var tolerance: Double = 0.25   // 0...1, color distance
+              var threshold: Double = 0.75   // 0...1, brightness for bright/dark
+              var minArea: Double = 0.002    // fraction of the frame
+              var maxBlobs: Int = 15
+              var labels: String = ""        // comma separated, assigned in a cycle
+              var color: RGB = .red          // box color
+              var textColor: RGB = .red      // label color
+
+              var labelList: [String] {
+                  labels.split(separator: ",")
+                      .map { $0.trimmingCharacters(in: .whitespaces) }
+                      .filter { !$0.isEmpty }
+              }
+          }
+
+          enum BlobDetector {
+              static let smallW = 200
+
+              // MARK: Public API
+
+              /// For every video frame (BGRA pixel buffer). Returns normalized rects, origin bottom-left.
+              static func detect(pixelBuffer pb: CVPixelBuffer, settings s: BlobSettings) -> [CGRect] {
+                  CVPixelBufferLockBaseAddress(pb, .readOnly)
+                  defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+                  guard let base = CVPixelBufferGetBaseAddress(pb) else { return [] }
+
+                  let W = CVPixelBufferGetWidth(pb)
+                  let H = CVPixelBufferGetHeight(pb)
+                  let bpr = CVPixelBufferGetBytesPerRow(pb)
+                  let sw = min(smallW, W)
+                  let sh = max(1, sw * H / W)
+
+                  var small = [UInt8](repeating: 0, count: sw * sh * 4)
+                  let src = base.assumingMemoryBound(to: UInt8.self)
+                  for y in 0..<sh {
+                      let py = min(H - 1, y * H / sh)
+                      for x in 0..<sw {
+                          let px = min(W - 1, x * W / sw)
+                          let o = py * bpr + px * 4
+                          let d = (y * sw + x) * 4
+                          small[d] = src[o]
+                          small[d + 1] = src[o + 1]
+                          small[d + 2] = src[o + 2]
+                      }
+                  }
+                  return blobs(small, sw, sh, s)
+              }
+
+              /// For the preview image.
+              static func detect(image: CGImage, settings s: BlobSettings) -> [CGRect] {
+                  guard let (px, w, h) = smallBitmap(image) else { return [] }
+                  return blobs(px, w, h, s)
+              }
+
+              /// Color under a point. nx, ny are normalized with the origin at the TOP-left.
+              static func pickColor(image: CGImage, nx: Double, ny: Double) -> (Double, Double, Double)? {
+                  guard let (px, w, h) = smallBitmap(image) else { return nil }
+                  let cx = min(w - 1, max(0, Int(nx * Double(w))))
+                  let cy = min(h - 1, max(0, Int(ny * Double(h))))
+                  var r = 0.0, g = 0.0, b = 0.0, n = 0.0
+                  for dy in -1...1 {
+                      for dx in -1...1 {
+                          let x = min(w - 1, max(0, cx + dx))
+                          let y = min(h - 1, max(0, cy + dy))
+                          let o = (y * w + x) * 4
+                          b += Double(px[o])
+                          g += Double(px[o + 1])
+                          r += Double(px[o + 2])
+                          n += 1
+                      }
+                  }
+                  return (r / n / 255, g / n / 255, b / n / 255)
+              }
+
+              // MARK: Internals
+
+              private static func smallBitmap(_ image: CGImage) -> ([UInt8], Int, Int)? {
+                  let sw = min(smallW, image.width)
+                  let sh = max(1, sw * image.height / image.width)
+                  var small = [UInt8](repeating: 0, count: sw * sh * 4)
+                  let info = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+                  let ok = small.withUnsafeMutableBytes { buf -> Bool in
+                      guard let ctx = CGContext(
+                          data: buf.baseAddress, width: sw, height: sh, bitsPerComponent: 8,
+                          bytesPerRow: sw * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: info
+                      ) else { return false }
+                      ctx.draw(image, in: CGRect(x: 0, y: 0, width: sw, height: sh))
+                      return true
+                  }
+                  return ok ? (small, sw, sh) : nil
+              }
+
+              /// px is BGRA, rows top to bottom.
+              private static func blobs(_ px: [UInt8], _ w: Int, _ h: Int, _ s: BlobSettings) -> [CGRect] {
+                  let total = w * h
+                  var mask = [Bool](repeating: false, count: total)
+
+                  let maxDist = s.tolerance * 441.67 // 255 * sqrt(3)
+                  let maxD2 = maxDist * maxDist
+                  let tr = s.tr * 255, tg = s.tg * 255, tb = s.tb * 255
+                  let thr = s.threshold * 255
+
+                  for i in 0..<total {
+                      let b = Double(px[i * 4])
+                      let g = Double(px[i * 4 + 1])
+                      let r = Double(px[i * 4 + 2])
+                      switch s.kind {
+                      case .color:
+                          let dr = r - tr, dg = g - tg, db = b - tb
+                          mask[i] = dr * dr + dg * dg + db * db <= maxD2
+                      case .bright:
+                          mask[i] = (0.299 * r + 0.587 * g + 0.114 * b) >= thr
+                      case .dark:
+                          mask[i] = (0.299 * r + 0.587 * g + 0.114 * b) <= thr
+                      }
+                  }
+
+                  var seen = [Bool](repeating: false, count: total)
+                  var found: [(count: Int, rect: CGRect)] = []
+                  var stack: [Int] = []
+                  let minPix = max(2, Int(s.minArea * Double(total)))
+                  let maxPix = Int(0.5 * Double(total)) // ignore huge regions like the whole sky
+
+                  for start in 0..<total where mask[start] && !seen[start] {
+                      seen[start] = true
+                      stack.append(start)
+                      var count = 0
+                      var minX = w, maxX = 0, minY = h, maxY = 0
+
+                      while let i = stack.popLast() {
+                          count += 1
+                          let x = i % w
+                          let y = i / w
+                          if x < minX { minX = x }
+                          if x > maxX { maxX = x }
+                          if y < minY { minY = y }
+                          if y > maxY { maxY = y }
+
+                          if x > 0, mask[i - 1], !seen[i - 1] { seen[i - 1] = true; stack.append(i - 1) }
+                          if x < w - 1, mask[i + 1], !seen[i + 1] { seen[i + 1] = true; stack.append(i + 1) }
+                          if y > 0, mask[i - w], !seen[i - w] { seen[i - w] = true; stack.append(i - w) }
+                          if y < h - 1, mask[i + w], !seen[i + w] { seen[i + w] = true; stack.append(i + w) }
+                      }
+
+                      if count >= minPix && count <= maxPix {
+                          let rect = CGRect(
+                              x: CGFloat(minX) / CGFloat(w),
+                              y: 1 - CGFloat(maxY + 1) / CGFloat(h),
+                              width: CGFloat(maxX - minX + 1) / CGFloat(w),
+                              height: CGFloat(maxY - minY + 1) / CGFloat(h))
+                          found.append((count, rect))
+                      }
+                  }
+
+                  found.sort { $0.count > $1.count }
+                  return found.prefix(s.maxBlobs).map { $0.rect }
+              }
+          }
+          __BT_END__
+          cat > Sources/Processor.swift <<'__BT_END__'
+          import AVFoundation
+          import Vision
+          import CoreText
+          import CoreGraphics
+
+          enum ProcError: LocalizedError {
+              case noVideo
+              case failed(String)
+
+              var errorDescription: String? {
+                  switch self {
+                  case .noVideo: return "В файле нет видеодорожки"
+                  case .failed(let s): return s
+                  }
+              }
+          }
+
+          struct DrawItem {
+              var rect: CGRect      // normalized, origin bottom-left
+              var label: String
+              var color: RGB
+              var textColor: RGB
+              var seed: Int
+          }
+
+          enum RenderMode {
+              case track([Box])
+              case blobs(BlobSettings)
+          }
+
+          /// Follows the chosen boxes from frame to frame.
+          /// A fresh request is built from the previous result on every frame (Apple's recommended pattern).
+          final class TrackState {
+              let boxes: [Box]
+              var obs: [VNDetectedObjectObservation]
+              var alive: [Bool]
+              var lostFrames: [Int]
+              var rects: [CGRect]
+              let seq = VNSequenceRequestHandler()
+
+              init(boxes: [Box]) {
+                  self.boxes = boxes
+                  self.rects = boxes.map { $0.rect }
+                  self.obs = boxes.map { VNDetectedObjectObservation(boundingBox: $0.rect) }
+                  self.alive = Array(repeating: true, count: boxes.count)
+                  self.lostFrames = Array(repeating: 0, count: boxes.count)
+              }
+
+              var items: [DrawItem] {
+                  boxes.indices.filter { alive[$0] }.map {
+                      DrawItem(rect: rects[$0], label: boxes[$0].label, color: boxes[$0].color,
+                               textColor: boxes[$0].textColor, seed: $0)
+                  }
+              }
+
+              func step(_ pb: CVPixelBuffer) {
+                  let idx = boxes.indices.filter { alive[$0] }
+                  if idx.isEmpty { return }
+
+                  let reqs: [VNTrackObjectRequest] = idx.map { i in
+                      let r = VNTrackObjectRequest(detectedObjectObservation: obs[i])
+                      r.trackingLevel = .accurate
+                      return r
+                  }
+
+                  do {
+                      try seq.perform(reqs, on: pb, orientation: .up)
+                  } catch {
+                      return // keep last known positions for this frame
+                  }
+
+                  for (k, i) in idx.enumerated() {
+                      guard let o = reqs[k].results?.first as? VNDetectedObjectObservation else {
+                          lostFrames[i] += 1
+                          if lostFrames[i] > 30 { alive[i] = false }
+                          continue
+                      }
+                      obs[i] = o
+                      rects[i] = o.boundingBox
+                      if o.confidence < 0.2 {
+                          lostFrames[i] += 1
+                          if lostFrames[i] > 45 { alive[i] = false }
+                      } else {
+                          lostFrames[i] = 0
+                      }
+                  }
+              }
+          }
+
+          enum Overlay {
+              /// Draws the boxes straight into the BGRA pixel buffer.
+              static func draw(on pb: CVPixelBuffer, items: [DrawItem], time: Double) {
+                  if items.isEmpty { return }
+                  CVPixelBufferLockBaseAddress(pb, [])
+                  defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+                  guard let base = CVPixelBufferGetBaseAddress(pb) else { return }
+
+                  let w = CVPixelBufferGetWidth(pb)
+                  let h = CVPixelBufferGetHeight(pb)
+                  let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+                  guard let ctx = CGContext(
+                      data: base, width: w, height: h, bitsPerComponent: 8,
+                      bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: bitmapInfo
+                  ) else { return }
+
+                  let W = CGFloat(w), H = CGFloat(h)
+                  let lw = max(2, W * 0.004)
+
+                  for it in items {
+                      let n = it.rect
+                      let r = CGRect(x: n.minX * W, y: n.minY * H, width: n.width * W, height: n.height * H)
+
+                      ctx.saveGState()
+                      ctx.setShadow(offset: .zero, blur: lw * 3, color: it.color.cg) // glow
+                      ctx.setStrokeColor(it.color.cg)
+                      ctx.setLineWidth(lw)
+                      ctx.stroke(r)
+
+                      if !it.label.isEmpty {
+                          let fontSize = max(14, W * 0.032)
+                          let font = CTFontCreateWithName("HelveticaNeue-CondensedBold" as CFString, fontSize, nil)
+                          let attrs: [CFString: Any] = [
+                              kCTFontAttributeName: font,
+                              kCTForegroundColorAttributeName: it.textColor.cg
+                          ]
+                          if let str = CFAttributedStringCreate(nil, Glitch.text(it.label, time: time, seed: it.seed) as CFString, attrs as CFDictionary) {
+                              let line = CTLineCreateWithAttributedString(str)
+                              let tw = CTLineGetBoundsWithOptions(line, []).width
+                              let stretch: CGFloat = 1.6
+                              ctx.textMatrix = CGAffineTransform(scaleX: 1, y: stretch)
+                              let x = min(max(4, r.minX), max(4, W - tw - 4))
+                              var y = r.maxY + lw + 3
+                              if y + fontSize * stretch > H { y = r.minY - fontSize * stretch - 3 }
+                              ctx.textPosition = CGPoint(x: x, y: y)
+                              CTLineDraw(line, ctx)
+                          }
+                      }
+                      ctx.restoreGState()
+                  }
+              }
+          }
+
+          final class VideoProcessor {
+              func run(url: URL, mode: RenderMode, progress: @escaping (Double) -> Void) async throws -> URL {
+                  let asset = AVURLAsset(url: url)
+                  guard let vTrack = try await asset.loadTracks(withMediaType: .video).first else {
+                      throw ProcError.noVideo
+                  }
+
+                  let comp = try await AVMutableVideoComposition.videoComposition(withPropertiesOf: asset)
+                  let evenW = max(2, Int(comp.renderSize.width) & ~1)
+                  let evenH = max(2, Int(comp.renderSize.height) & ~1)
+                  comp.renderSize = CGSize(width: evenW, height: evenH)
+
+                  let duration = max(0.001, try await asset.load(.duration).seconds)
+                  let aTrack = try await asset.loadTracks(withMediaType: .audio).first
+                  var audioHint: CMFormatDescription?
+                  if let aTrack { audioHint = try await aTrack.load(.formatDescriptions).first }
+
+                  let reader = try AVAssetReader(asset: asset)
+                  let vOut = AVAssetReaderVideoCompositionOutput(
+                      videoTracks: [vTrack],
+                      videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+                  )
+                  vOut.videoComposition = comp
+                  reader.add(vOut)
+
+                  var aOut: AVAssetReaderTrackOutput?
+                  if let aTrack {
+                      let o = AVAssetReaderTrackOutput(track: aTrack, outputSettings: nil)
+                      if reader.canAdd(o) { reader.add(o); aOut = o }
+                  }
+
+                  let outURL = FileManager.default.temporaryDirectory
+                      .appendingPathComponent("tracked_\(UUID().uuidString).mp4")
+                  try? FileManager.default.removeItem(at: outURL)
+                  let writer = try AVAssetWriter(outputURL: outURL, fileType: .mp4)
+
+                  let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: [
+                      AVVideoCodecKey: AVVideoCodecType.h264,
+                      AVVideoWidthKey: evenW,
+                      AVVideoHeightKey: evenH,
+                      AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: evenW * evenH * 6]
+                  ])
+                  vIn.expectsMediaDataInRealTime = false
+                  let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                      assetWriterInput: vIn,
+                      sourcePixelBufferAttributes: [
+                          kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                          kCVPixelBufferWidthKey as String: evenW,
+                          kCVPixelBufferHeightKey as String: evenH
+                      ]
+                  )
+                  writer.add(vIn)
+
+                  var aIn: AVAssetWriterInput?
+                  if aOut != nil {
+                      let i = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: audioHint)
+                      i.expectsMediaDataInRealTime = false
+                      if writer.canAdd(i) { writer.add(i); aIn = i }
+                  }
+
+                  // Mode setup
+                  var trackBoxes: [Box] = []
+                  var blobSettings = BlobSettings()
+                  var blobLabels: [String] = []
+                  var useBlobs = false
+                  switch mode {
+                  case .track(let b):
+                      trackBoxes = b
+                  case .blobs(let s):
+                      useBlobs = true
+                      blobSettings = s
+                      blobLabels = s.labelList
+                  }
+                  let state = TrackState(boxes: trackBoxes)
+                  let blobsOn = useBlobs
+                  let bs = blobSettings
+                  let labels = blobLabels
+
+                  return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
+                      guard reader.startReading() else {
+                          cont.resume(throwing: reader.error ?? ProcError.failed("Не удалось прочитать видео"))
+                          return
+                      }
+                      guard writer.startWriting() else {
+                          cont.resume(throwing: writer.error ?? ProcError.failed("Не удалось начать запись"))
+                          return
+                      }
+                      writer.startSession(atSourceTime: .zero)
+
+                      let group = DispatchGroup()
+                      var lastReported = 0.0
+
+                      group.enter()
+                      vIn.requestMediaDataWhenReady(on: DispatchQueue(label: "bt.video")) {
+                          while vIn.isReadyForMoreMediaData {
+                              guard let sb = vOut.copyNextSampleBuffer(),
+                                    let pb = CMSampleBufferGetImageBuffer(sb) else {
+                                  vIn.markAsFinished()
+                                  group.leave()
+                                  return
+                              }
+                              let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+
+                              var items: [DrawItem]
+                              if blobsOn {
+                                  let rects = BlobDetector.detect(pixelBuffer: pb, settings: bs)
+                                  items = []
+                                  for (k, r) in rects.enumerated() {
+                                      let text = labels.isEmpty ? "" : labels[k % labels.count]
+                                      items.append(DrawItem(rect: r, label: text, color: bs.color, textColor: bs.textColor, seed: k))
+                                  }
+                              } else {
+                                  state.step(pb)
+                                  items = state.items
+                              }
+                              Overlay.draw(on: pb, items: items, time: pts.seconds)
+
+                              if !adaptor.append(pb, withPresentationTime: pts) {
+                                  vIn.markAsFinished()
+                                  group.leave()
+                                  return
+                              }
+                              let p = min(1, pts.seconds / duration)
+                              if p - lastReported > 0.01 {
+                                  lastReported = p
+                                  progress(p)
+                              }
+                          }
+                      }
+
+                      if let aIn, let aOut {
+                          group.enter()
+                          aIn.requestMediaDataWhenReady(on: DispatchQueue(label: "bt.audio")) {
+                              while aIn.isReadyForMoreMediaData {
+                                  if let sb = aOut.copyNextSampleBuffer() {
+                                      aIn.append(sb)
+                                  } else {
+                                      aIn.markAsFinished()
+                                      group.leave()
+                                      return
+                                  }
+                              }
+                          }
+                      }
+
+                      group.notify(queue: .global()) {
+                          if reader.status == .failed {
+                              writer.cancelWriting()
+                              cont.resume(throwing: reader.error ?? ProcError.failed("Ошибка чтения"))
+                              return
+                          }
+                          writer.finishWriting {
+                              if writer.status == .completed {
+                                  cont.resume(returning: outURL)
+                              } else {
+                                  cont.resume(throwing: writer.error ?? ProcError.failed("Ошибка записи"))
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          __BT_END__
+          cat > Sources/ContentView.swift <<'__BT_END__'
+          import SwiftUI
+          import PhotosUI
+          import AVFoundation
+          import AVKit
+
+          struct ContentView: View {
+              @State private var pickerItem: PhotosPickerItem?
+              @State private var videoURL: URL?
+              @State private var frameImage: UIImage?
+              @State private var frameCG: CGImage?
+              @State private var boxes: [Box] = []
+              @State private var mode: DetectMode = .rects
+              @State private var activeID: UUID?
+              @State private var draft: CGRect?
+              @State private var busy = false
+              @State private var progress = 0.0
+              @State private var resultURL: URL?
+              @State private var message: String?
+
+              @State private var useBlobs = false
+              @State private var blob = BlobSettings()
+              @State private var blobRects: [CGRect] = []
+
+              var body: some View {
+                  NavigationStack {
+                      ScrollView {
+                          VStack(spacing: 14) {
+                              PhotosPicker(selection: $pickerItem, matching: .videos) {
+                                  Label(frameImage == nil ? "Выбрать видео" : "Другое видео", systemImage: "video.badge.plus")
+                                      .frame(maxWidth: .infinity)
+                              }
+                              .buttonStyle(.borderedProminent)
+
+                              if let frameImage {
+                                  Picker("Режим", selection: $useBlobs) {
+                                      Text("Рамки + трекинг").tag(false)
+                                      Text("Блобы (цвет/яркость)").tag(true)
+                                  }
+                                  .pickerStyle(.segmented)
+                                  .onChange(of: useBlobs) { _, _ in recomputeBlobs() }
+
+                                  preview(frameImage)
+
+                                  if useBlobs {
+                                      blobEditor
+                                  } else {
+                                      Text("Тап по рамке: включить. Ещё тап: выключить. Протяни пальцем по кадру, чтобы нарисовать свою рамку.")
+                                          .font(.footnote)
+                                          .foregroundStyle(.secondary)
+
+                                      Picker("Что искать", selection: $mode) {
+                                          ForEach(DetectMode.allCases) { Text($0.rawValue).tag($0) }
+                                      }
+                                      .pickerStyle(.menu)
+                                      .onChange(of: mode) { _, _ in redetect() }
+
+                                      editor
+                                  }
+
+                                  Button {
+                                      Task { await render() }
+                                  } label: {
+                                      if busy {
+                                          ProgressView(value: progress).frame(maxWidth: .infinity)
+                                      } else {
+                                          Label("Сделать видео", systemImage: "wand.and.stars").frame(maxWidth: .infinity)
+                                      }
+                                  }
+                                  .buttonStyle(.borderedProminent)
+                                  .tint(.red)
+                                  .disabled(busy || (!useBlobs && !boxes.contains(where: { $0.enabled })))
+                              }
+
+                              if let resultURL {
+                                  VideoPlayer(player: AVPlayer(url: resultURL))
+                                      .frame(height: 360)
+                                      .clipShape(RoundedRectangle(cornerRadius: 12))
+                                  HStack {
+                                      Button("Сохранить в галерею") { saveToPhotos(resultURL) }
+                                          .buttonStyle(.bordered)
+                                      ShareLink(item: resultURL)
+                                  }
+                              }
+                          }
+                          .padding()
+                      }
+                      .navigationTitle("BlobTracker")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .onChange(of: pickerItem) { _, item in
+                          guard let item else { return }
+                          Task {
+                              if let v = try? await item.loadTransferable(type: VideoFile.self) {
+                                  await setVideo(v.url)
+                              } else {
+                                  message = "Не получилось загрузить видео"
+                              }
+                          }
+                      }
+                      .onChange(of: blob) { _, _ in recomputeBlobs() }
+                      .alert("BlobTracker", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
+                          Button("OK", role: .cancel) {}
+                      } message: {
+                          Text(message ?? "")
+                      }
+                  }
+              }
+
+              // MARK: - Preview with overlay
+
+              private func preview(_ img: UIImage) -> some View {
+                  Image(uiImage: img)
+                      .resizable()
+                      .scaledToFit()
+                      .overlay {
+                          GeometryReader { geo in
+                              let W = geo.size.width
+                              let H = geo.size.height
+                              ZStack(alignment: .topLeading) {
+                                  if useBlobs {
+                                      ForEach(blobRects.indices, id: \.self) { i in
+                                          let r = uiRect(blobRects[i], W, H)
+                                          Rectangle()
+                                              .stroke(blob.color.ui, lineWidth: 2)
+                                              .frame(width: r.width, height: r.height)
+                                              .offset(x: r.minX, y: r.minY)
+                                          if !blob.labelList.isEmpty {
+                                              GlitchLabel(text: blob.labelList[i % blob.labelList.count],
+                                                          color: blob.textColor, seed: i)
+                                                  .offset(x: r.minX, y: max(0, r.minY - 15))
+                                          }
+                                      }
+                                  } else {
+                                      ForEach(Array(boxes.enumerated()), id: \.element.id) { idx, b in
+                                          let r = uiRect(b.rect, W, H)
+                                          Rectangle()
+                                              .stroke(b.enabled ? b.color.ui : Color.white.opacity(0.4),
+                                                      lineWidth: b.id == activeID ? 3.5 : (b.enabled ? 2 : 1))
+                                              .frame(width: r.width, height: r.height)
+                                              .offset(x: r.minX, y: r.minY)
+                                          if b.enabled && !b.label.isEmpty {
+                                              GlitchLabel(text: b.label, color: b.textColor, seed: idx)
+                                                  .offset(x: r.minX, y: max(0, r.minY - 15))
+                                          }
+                                      }
+                                      if let d = draft {
+                                          Rectangle()
+                                              .stroke(Color.yellow, style: StrokeStyle(lineWidth: 1.5, dash: [4]))
+                                              .frame(width: d.width, height: d.height)
+                                              .offset(x: d.minX, y: d.minY)
+                                      }
+                                  }
+                              }
+                              .frame(width: W, height: H, alignment: .topLeading)
+                              .contentShape(Rectangle())
+                              .gesture(
+                                  DragGesture(minimumDistance: 0)
+                                      .onChanged { v in
+                                          guard !useBlobs else { return }
+                                          if hypot(v.translation.width, v.translation.height) > 10 {
+                                              draft = CGRect(
+                                                  x: min(v.startLocation.x, v.location.x),
+                                                  y: min(v.startLocation.y, v.location.y),
+                                                  width: abs(v.location.x - v.startLocation.x),
+                                                  height: abs(v.location.y - v.startLocation.y))
+                                          }
+                                      }
+                                      .onEnded { v in
+                                          let moved = hypot(v.translation.width, v.translation.height)
+                                          if useBlobs {
+                                              if moved <= 10 { pickColor(at: v.location, W, H) }
+                                          } else if moved > 10, let d = draft {
+                                              addManualBox(d, W, H)
+                                          } else {
+                                              tap(at: v.location, W, H)
+                                          }
+                                          draft = nil
+                                      }
+                              )
+                          }
+                      }
+                      .clipShape(RoundedRectangle(cornerRadius: 8))
+              }
+
+              // MARK: - Editors
+
+              @ViewBuilder
+              private var editor: some View {
+                  if let i = boxes.firstIndex(where: { $0.id == activeID }) {
+                      VStack(alignment: .leading, spacing: 10) {
+                          TextField("Подпись (например: do you see him too?)", text: $boxes[i].label)
+                              .textFieldStyle(.roundedBorder)
+
+                          HStack {
+                              Button("OFFLINE") {
+                                  boxes[i].label = "OFFLINE"
+                                  boxes[i].color = .red
+                                  boxes[i].textColor = .red
+                              }
+                              Button("ONLINE") {
+                                  boxes[i].label = "ONLINE"
+                                  boxes[i].color = .green
+                                  boxes[i].textColor = .green
+                              }
+                              Spacer()
+                          }
+                          .buttonStyle(.bordered)
+
+                          ColorRow(title: "Цвет рамки", selection: $boxes[i].color)
+                          ColorRow(title: "Цвет текста", selection: $boxes[i].textColor)
+
+                          Button("Удалить рамку", role: .destructive) {
+                              boxes.remove(at: i)
+                              activeID = nil
+                          }
+                      }
+                      .padding(12)
+                      .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+                  }
+              }
+
+              private var blobEditor: some View {
+                  VStack(alignment: .leading, spacing: 10) {
+                      Picker("Что ловить", selection: $blob.kind) {
+                          ForEach(BlobSettings.Kind.allCases) { Text($0.rawValue).tag($0) }
+                      }
+                      .pickerStyle(.segmented)
+
+                      if blob.kind == .color {
+                          HStack {
+                              Text("Цвет:")
+                              Circle()
+                                  .fill(Color(red: blob.tr, green: blob.tg, blue: blob.tb))
+                                  .frame(width: 22, height: 22)
+                              Text("тапни по кадру, чтобы выбрать")
+                                  .font(.footnote)
+                                  .foregroundStyle(.secondary)
+                          }
+                          sliderRow("Допуск цвета", $blob.tolerance, 0.05...0.7)
+                      } else {
+                          sliderRow(blob.kind == .bright ? "Порог яркости" : "Порог темноты", $blob.threshold, 0.05...0.95)
+                      }
+
+                      sliderRow("Минимальный размер пятна", $blob.minArea, 0.0003...0.05)
+                      Stepper("Макс. рамок: \(blob.maxBlobs)", value: $blob.maxBlobs, in: 1...60)
+
+                      TextField("Подписи через запятую (OFFLINE, ONLINE)", text: $blob.labels)
+                          .textFieldStyle(.roundedBorder)
+
+                      ColorRow(title: "Цвет рамок", selection: $blob.color)
+                      ColorRow(title: "Цвет текста", selection: $blob.textColor)
+                  }
+                  .padding(12)
+                  .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+              }
+
+              private func sliderRow(_ title: String, _ value: Binding<Double>, _ range: ClosedRange<Double>) -> some View {
+                  VStack(alignment: .leading, spacing: 2) {
+                      Text(title).font(.footnote)
+                      Slider(value: value, in: range)
+                  }
+              }
+
+              // MARK: - Geometry helpers
+
+              /// Normalized bottom-left rect -> top-left rect in points.
+              private func uiRect(_ r: CGRect, _ W: CGFloat, _ H: CGFloat) -> CGRect {
+                  CGRect(x: r.minX * W, y: (1 - r.maxY) * H, width: r.width * W, height: r.height * H)
+              }
+
+              private func tap(at p: CGPoint, _ W: CGFloat, _ H: CGFloat) {
+                  let n = CGPoint(x: p.x / W, y: 1 - p.y / H)
+                  let hits = boxes.indices.filter { boxes[$0].rect.contains(n) }
+                  guard let i = hits.min(by: { area(boxes[$0].rect) < area(boxes[$1].rect) }) else {
+                      activeID = nil
+                      return
+                  }
+                  if boxes[i].enabled && activeID == boxes[i].id {
+                      boxes[i].enabled = false
+                      activeID = nil
+                  } else {
+                      boxes[i].enabled = true
+                      activeID = boxes[i].id
+                  }
+              }
+
+              private func area(_ r: CGRect) -> CGFloat { r.width * r.height }
+
+              private func addManualBox(_ d: CGRect, _ W: CGFloat, _ H: CGFloat) {
+                  let x = max(0, d.minX / W)
+                  let w = min(1 - x, d.width / W)
+                  let yTop = max(0, d.minY / H)
+                  let h = min(1 - yTop, d.height / H)
+                  guard w > 0.01, h > 0.01 else { return }
+                  var b = Box(rect: CGRect(x: x, y: 1 - yTop - h, width: w, height: h))
+                  b.enabled = true
+                  boxes.append(b)
+                  activeID = b.id
+              }
+
+              private func pickColor(at p: CGPoint, _ W: CGFloat, _ H: CGFloat) {
+                  guard blob.kind == .color, let cg = frameCG else { return }
+                  if let c = BlobDetector.pickColor(image: cg, nx: Double(p.x / W), ny: Double(p.y / H)) {
+                      blob.tr = c.0
+                      blob.tg = c.1
+                      blob.tb = c.2
+                  }
+              }
+
+              // MARK: - Actions
+
+              private func setVideo(_ url: URL) async {
+                  videoURL = url
+                  resultURL = nil
+                  activeID = nil
+                  do {
+                      let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+                      gen.appliesPreferredTrackTransform = true
+                      let cg = try await gen.image(at: .zero).image
+                      frameCG = cg
+                      frameImage = UIImage(cgImage: cg)
+                      redetect()
+                      recomputeBlobs()
+                  } catch {
+                      message = "Не удалось взять кадр: \(error.localizedDescription)"
+                  }
+              }
+
+              private func redetect() {
+                  guard let cg = frameCG else { return }
+                  let m = mode
+                  activeID = nil
+                  Task {
+                      let rects = await Task.detached { Detector.detect(cg, mode: m) }.value
+                      // keep boxes the user already enabled or drew by hand
+                      let kept = boxes.filter { $0.enabled }
+                      boxes = kept + rects.map { Box(rect: $0) }
+                  }
+              }
+
+              private func recomputeBlobs() {
+                  guard useBlobs, let cg = frameCG else {
+                      blobRects = []
+                      return
+                  }
+                  blobRects = BlobDetector.detect(image: cg, settings: blob)
+              }
+
+              private func render() async {
+                  guard let url = videoURL else { return }
+                  let renderMode: RenderMode
+                  if useBlobs {
+                      renderMode = .blobs(blob)
+                  } else {
+                      let chosen = boxes.filter { $0.enabled }
+                      guard !chosen.isEmpty else { return }
+                      renderMode = .track(chosen)
+                  }
+                  busy = true
+                  progress = 0
+                  resultURL = nil
+                  do {
+                      let out = try await VideoProcessor().run(url: url, mode: renderMode) { p in
+                          DispatchQueue.main.async { self.progress = p }
+                      }
+                      resultURL = out
+                  } catch {
+                      message = error.localizedDescription
+                  }
+                  busy = false
+              }
+
+              private func saveToPhotos(_ url: URL) {
+                  PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+                      guard status == .authorized || status == .limited else {
+                          DispatchQueue.main.async { message = "Нет доступа к галерее" }
+                          return
+                      }
+                      PHPhotoLibrary.shared().performChanges({
+                          PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+                      }) { ok, _ in
+                          DispatchQueue.main.async { message = ok ? "Сохранено в галерею" : "Не удалось сохранить" }
+                      }
+                  }
+              }
+          }
+          __BT_END__
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build
+        run: |
+          xcodebuild \
+            -project BlobTracker.xcodeproj \
+            -scheme BlobTracker \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package ipa
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/BlobTracker.app Payload/
+          zip -r BlobTracker.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlobTracker-ipa
+          path: BlobTracker.ipa
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" BlobTracker.ipa \
+            --title "BlobTracker build ${{ github.run_number }}" \
+            --notes "Unsigned IPA. Install via AltStore, Sideloadly or TrollStore."
