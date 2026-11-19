@@ -1779,6 +1779,7 @@ jobs:
               @Published var proposals: [CGRect] = []
               @Published var blobRects: [CGRect] = []
               @Published var baseFrame: CGImage?
+              @Published var fxClipboard: BoxFX?     // скопированные эффекты рамки
               @Published var busy = false
               @Published var exporting = false
               @Published var progress = 0.0
@@ -2338,6 +2339,16 @@ jobs:
                   guard let i = boxes.firstIndex(where: { $0.id == id }) else { return }
                   boxes[i].fx.on = s
                   rebuild()
+              }
+
+              func copyFX(from id: UUID) {
+                  guard let b = boxes.first(where: { $0.id == id }), !b.fx.on.isEmpty else { return }
+                  fxClipboard = b.fx
+              }
+
+              func pasteFX(to id: UUID) {
+                  guard let c = fxClipboard else { return }
+                  setFX(id, c.on)
               }
 
               func copyFXToAll(from id: UUID) {
@@ -2937,7 +2948,7 @@ jobs:
                           .alert("Как пользоваться", isPresented: $showHelp) {
                               Button("OK", role: .cancel) {}
                           } message: {
-                              Text("Рамка: открой «Рамки» и нарисуй её пальцем на кадре, дальше она поедет за объектом сама. Тащи рамку или белую точку в углу, чтобы поправить: трекинг пересчитается с этого кадра.\n\nТаймлайн: тяни его пальцем, курсор стоит по центру. Тап по клипу выбирает его, тап по рамке в нижней дорожке открывает её настройки.\n\nБлобы: рамки вокруг ярких, тёмных или одноцветных пятен на всём видео.\n\nЭффекты: выбери рамку и открой вкладку «Эффекты». Набор можно скопировать на все рамки одной кнопкой.")
+                              Text("Рамка: открой «Рамки» и нарисуй её пальцем на кадре, дальше она поедет за объектом сама. Тащи рамку или белую точку в углу, чтобы поправить: трекинг пересчитается с этого кадра.\n\nТаймлайн: тяни его пальцем, курсор стоит по центру. Тап по клипу выбирает его, тап по рамке в нижней дорожке открывает её настройки.\n\nБлобы: рамки вокруг ярких, тёмных или одноцветных пятен на всём видео.\n\nЭффекты: выбери рамку и открой вкладку «Эффекты». Набор можно скопировать кнопкой «Скопировать» и вставить в другую рамку, либо одной кнопкой отправить всем.")
                           }
 
                       previewArea
@@ -3455,6 +3466,27 @@ jobs:
                                   }
                               }
                           }
+                      }
+
+                      HStack {
+                          Button {
+                              if let id = ed.selectedBoxID { ed.copyFX(from: id) }
+                          } label: {
+                              Label("Скопировать", systemImage: "doc.on.doc")
+                          }
+                          .buttonStyle(ChipButtonStyle())
+                          .disabled(ed.boxes.first(where: { $0.id == ed.selectedBoxID })?.fx.on.isEmpty ?? true)
+
+                          Button {
+                              if let id = ed.selectedBoxID { ed.pasteFX(to: id) }
+                          } label: {
+                              Label(ed.fxClipboard.map { "Вставить (\($0.on.count))" } ?? "Вставить",
+                                    systemImage: "doc.on.clipboard")
+                          }
+                          .buttonStyle(ChipButtonStyle(selected: ed.fxClipboard != nil))
+                          .disabled(ed.fxClipboard == nil || ed.selectedBoxID == nil)
+
+                          Spacer(minLength: 0)
                       }
 
                       if let i = ed.boxes.firstIndex(where: { $0.id == ed.selectedBoxID }) {
