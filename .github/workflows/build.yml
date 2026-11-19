@@ -107,6 +107,74 @@ jobs:
               var alive: Bool
           }
 
+          /// Эффекты рамки. Каждый считается только от времени и seed,
+          /// поэтому в превью и в готовом видео они выглядят одинаково.
+          enum FXGroup: String, CaseIterable, Identifiable {
+              case question = "Знак вопроса"
+              case frame = "Рамка"
+              case text = "Подпись и данные"
+              case scene = "Появление и кадр"
+              var id: String { rawValue }
+          }
+
+          enum FXKind: String, CaseIterable, Codable, Identifiable {
+              case flyQ, growQ, cornerQ, rainQ, doubt
+              case lockOn, brackets, rgb, trail, scan, dashed, links
+              case typing, data
+              case vanish, pixel, spot, beep
+
+              var id: String { rawValue }
+
+              var title: String {
+                  switch self {
+                  case .flyQ: return "Вылетающие «?»"
+                  case .growQ: return "Растущая подпись"
+                  case .cornerQ: return "«?» на углу"
+                  case .rainQ: return "Дождь из «?»"
+                  case .doubt: return "Сомнение"
+                  case .lockOn: return "Lock-on"
+                  case .brackets: return "Скобки"
+                  case .rgb: return "RGB-глитч"
+                  case .trail: return "Шлейф"
+                  case .scan: return "Сканлайн"
+                  case .dashed: return "Пунктир"
+                  case .links: return "Связи"
+                  case .typing: return "Печать"
+                  case .data: return "Данные"
+                  case .vanish: return "Исчезновение"
+                  case .pixel: return "Пикселизация"
+                  case .spot: return "Spotlight"
+                  case .beep: return "Писк"
+                  }
+              }
+
+              var group: FXGroup {
+                  switch self {
+                  case .flyQ, .growQ, .cornerQ, .rainQ, .doubt: return .question
+                  case .lockOn, .brackets, .rgb, .trail, .scan, .dashed, .links: return .frame
+                  case .typing, .data: return .text
+                  case .vanish, .pixel, .spot, .beep: return .scene
+                  }
+              }
+
+              /// Что имеет смысл для блобов (у них нет возраста и истории движения).
+              static let blobKinds: [FXKind] = [.flyQ, .cornerQ, .rainQ, .doubt, .brackets, .rgb,
+                                                .scan, .dashed, .links, .data, .pixel, .spot]
+          }
+
+          struct BoxFX: Codable, Equatable {
+              var on: Set<FXKind> = []
+
+              func has(_ k: FXKind) -> Bool { on.contains(k) }
+
+              mutating func toggle(_ k: FXKind) {
+                  if on.contains(k) { on.remove(k) } else { on.insert(k) }
+              }
+
+              /// Быстрый набор: вылетающие «?», растущая подпись, lock-on, RGB-глитч, печать.
+              static let pack: Set<FXKind> = [.flyQ, .growQ, .lockOn, .rgb, .typing]
+          }
+
           /// Кусок видео на таймлайне.
           struct Clip: Identifiable, Codable {
               var id = UUID()
@@ -128,6 +196,11 @@ jobs:
               var color: RGB = .red
               var textColor: RGB = .red
               var samples: [Sample] = []
+              var fxv: BoxFX? = nil      // эффекты (nil в старых проектах)
+              var fx: BoxFX {
+                  get { fxv ?? BoxFX() }
+                  set { fxv = newValue }
+              }
           }
 
           struct Music: Codable {
@@ -219,23 +292,44 @@ jobs:
                   return s
               }
 
-              static func items(_ clips: [Clip], _ boxes: [Box], _ t: Double) -> [DrawItem] {
+              static func items(_ clips: [Clip], _ boxes: [Box], _ t: Double,
+                                selected: UUID? = nil, dragged: (id: UUID, rect: CGRect)? = nil) -> [DrawItem] {
                   guard let l = loc(clips, t) else { return [] }
                   var out: [DrawItem] = []
                   for (i, b) in boxes.enumerated() where b.srcID == l.clip.srcID {
-                      if let s = sample(b, l.src) {
-                          out.append(DrawItem(rect: s.rect, label: b.label, color: b.color, textColor: b.textColor, seed: i))
+                      guard let s = sample(b, l.src) else { continue }
+                      var rect = s.rect
+                      if let o = dragged, o.id == b.id { rect = o.rect }
+
+                      // когда рамка исчезнет (нужно для анимации исчезновения)
+                      var endT = b.hideAfter ?? Double.infinity
+                      if let last = b.samples.last {
+                          endT = min(endT, last.alive ? last.t + 0.12 : last.t)
                       }
+
+                      var tr: [CGRect] = []
+                      if b.fx.has(.trail) {
+                          for k in 1...6 {
+                              let ts = l.src - Double(k) * 0.05
+                              if ts < b.startT { break }
+                              if let ps = sample(b, ts) { tr.append(ps.rect) }
+                          }
+                      }
+
+                      out.append(DrawItem(rect: rect, label: b.label, color: b.color, textColor: b.textColor, seed: i,
+                                          fx: b.fx, age: l.src - b.startT, rem: endT - l.src, trail: tr,
+                                          selected: b.id == selected))
                   }
                   return out
               }
 
-              static func blobItems(_ rects: [CGRect], _ s: BlobSettings) -> [DrawItem] {
+              static func blobItems(_ rects: [CGRect], _ s: BlobSettings, time: Double = 0) -> [DrawItem] {
                   let labels = s.labelList
                   var out: [DrawItem] = []
                   for (k, r) in rects.enumerated() {
                       let text = labels.isEmpty ? "" : labels[k % labels.count]
-                      out.append(DrawItem(rect: r, label: text, color: s.color, textColor: s.textColor, seed: k))
+                      out.append(DrawItem(rect: r, label: text, color: s.color, textColor: s.textColor, seed: k,
+                                          fx: s.fx, age: time + 5))
                   }
                   return out
               }
@@ -459,6 +553,11 @@ jobs:
               var labels: String = ""        // comma separated, assigned in a cycle
               var color: RGB = .red          // box color
               var textColor: RGB = .red      // label color
+              var fxv: BoxFX? = nil          // effects (nil in old projects)
+              var fx: BoxFX {
+                  get { fxv ?? BoxFX() }
+                  set { fxv = newValue }
+              }
 
               var labelList: [String] {
                   labels.split(separator: ",")
@@ -617,6 +716,7 @@ jobs:
           import CoreText
           import CoreGraphics
           import AudioToolbox
+          import UIKit
 
           enum ProcError: LocalizedError {
               case noVideo
@@ -636,6 +736,11 @@ jobs:
               var color: RGB
               var textColor: RGB
               var seed: Int
+              var fx = BoxFX()
+              var age = 100.0       // сколько секунд рамка уже живёт
+              var rem = 100.0       // сколько секунд ей осталось
+              var trail: [CGRect] = []   // прошлые положения для шлейфа (normalized)
+              var selected = false
           }
 
           private func sec(_ s: Double) -> CMTime {
@@ -867,7 +972,7 @@ jobs:
           }
 
           enum Builder {
-              static func build(clips: [Clip], music: Music?, render R: CGSize) async throws -> Built {
+              static func build(clips: [Clip], music: Music?, render R: CGSize, beeps: [Double] = []) async throws -> Built {
                   let comp = AVMutableComposition()
                   guard let vTrack = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
                       throw ProcError.failed("Не удалось создать видеодорожку")
@@ -952,6 +1057,19 @@ jobs:
                       }
                   }
 
+                  // Писк при появлении рамок
+                  if !beeps.isEmpty, let bu = Beep.ensure() {
+                      let ba = AVURLAsset(url: bu)
+                      if let bsrc = try await ba.loadTracks(withMediaType: .audio).first,
+                         let bt = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) {
+                          var lastT = -1.0
+                          for t in beeps.sorted() where t < total - 0.13 && t - lastT > Beep.duration + 0.01 {
+                              try bt.insertTimeRange(CMTimeRange(start: .zero, duration: sec(Beep.duration)), of: bsrc, at: sec(t))
+                              lastT = t
+                          }
+                      }
+                  }
+
                   let vc = AVMutableVideoComposition()
                   vc.instructions = instrs
                   vc.renderSize = R
@@ -959,6 +1077,37 @@ jobs:
                   vc.frameDuration = CMTime(value: 1, timescale: fpsI)
 
                   return Built(comp: comp, vcomp: vc, mix: mix, duration: total)
+              }
+          }
+
+          /// Короткий писк, который ставится на таймлайн в момент появления рамки.
+          enum Beep {
+              static let duration = 0.12
+
+              static var url: URL {
+                  FileManager.default.temporaryDirectory.appendingPathComponent("bt_beep.wav")
+              }
+
+              static func ensure() -> URL? {
+                  let u = url
+                  if FileManager.default.fileExists(atPath: u.path) { return u }
+                  let sr = 44100
+                  let n = Int(Double(sr) * duration)
+                  var d = Data()
+                  func u32(_ v: UInt32) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 4)) }
+                  func u16(_ v: UInt16) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 2)) }
+                  d.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + n * 2)); d.append(contentsOf: Array("WAVE".utf8))
+                  d.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(1); u16(1); u32(UInt32(sr)); u32(UInt32(sr * 2)); u16(2); u16(16)
+                  d.append(contentsOf: Array("data".utf8)); u32(UInt32(n * 2))
+                  for i in 0..<n {
+                      let t = Double(i) / Double(sr)
+                      let ph = 2 * Double.pi * (1400 * t - 0.5 * (700 / duration) * t * t)
+                      let sq = sin(ph) > 0 ? 1.0 : -1.0
+                      let v = sq * 0.2 * exp(-t * 25)
+                      u16(UInt16(bitPattern: Int16(max(-1, min(1, v)) * 32000)))
+                  }
+                  do { try d.write(to: u) } catch { return nil }
+                  return u
               }
           }
 
@@ -983,55 +1132,328 @@ jobs:
                   return lines.isEmpty ? [text] : lines
               }
 
-              /// Draws the boxes straight into the BGRA pixel buffer.
-              static func draw(on pb: CVPixelBuffer, items: [DrawItem], time: Double) {
+              // MARK: Helpers
+
+              /// Детерминированный шум 0..<1: зависит только от чисел, поэтому превью и видео совпадают.
+              static func rnd(_ a: Int, _ b: Int) -> Double {
+                  var z = UInt64(truncatingIfNeeded: a) &* 0x9E3779B97F4A7C15
+                  z = z &+ UInt64(truncatingIfNeeded: b) &* 0xBF58476D1CE4E5B9
+                  z = z &+ 0x94D049BB133111EB
+                  z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+                  z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+                  z = z ^ (z >> 31)
+                  return Double(z % 100000) / 100000.0
+              }
+
+              static func col(_ c: RGB, _ a: CGFloat = 1) -> CGColor {
+                  CGColor(red: CGFloat(c.r), green: CGFloat(c.g), blue: CGFloat(c.b), alpha: a)
+              }
+
+              static func makeLine(_ s: String, _ font: CTFont, _ color: CGColor) -> CTLine? {
+                  let attrs: [CFString: Any] = [
+                      kCTFontAttributeName: font,
+                      kCTForegroundColorAttributeName: color
+                  ]
+                  guard let a = CFAttributedStringCreate(nil, s as CFString, attrs as CFDictionary) else { return nil }
+                  return CTLineCreateWithAttributedString(a)
+              }
+
+              /// Одна строка текста; center = true ставит её центром в точку (x, y).
+              static func put(_ ctx: CGContext, _ s: String, font: CTFont, color: CGColor, x: CGFloat, y: CGFloat,
+                              center: Bool = false, rot: CGFloat = 0, alpha: CGFloat = 1) {
+                  guard let l = makeLine(s, font, color) else { return }
+                  let b = CTLineGetBoundsWithOptions(l, [])
+                  ctx.saveGState()
+                  ctx.setAlpha(alpha)
+                  ctx.translateBy(x: x, y: y)
+                  ctx.rotate(by: rot)
+                  ctx.textMatrix = .identity
+                  ctx.textPosition = CGPoint(x: center ? -b.width / 2 - b.minX : 0, y: center ? -b.midY : 0)
+                  CTLineDraw(l, ctx)
+                  ctx.restoreGState()
+              }
+
+              static func strokeFrame(_ ctx: CGContext, _ r: CGRect, color: CGColor, lw: CGFloat,
+                                      brackets: Bool, dashed: Bool, time: Double, k: CGFloat) {
+                  ctx.saveGState()
+                  ctx.setStrokeColor(color)
+                  ctx.setLineWidth(lw)
+                  if brackets {
+                      let L = min(r.width, r.height) * 0.28 * CGFloat(1 + 0.2 * sin(time * 8))
+                      let p = CGMutablePath()
+                      p.move(to: CGPoint(x: r.minX, y: r.minY + L))
+                      p.addLine(to: CGPoint(x: r.minX, y: r.minY))
+                      p.addLine(to: CGPoint(x: r.minX + L, y: r.minY))
+                      p.move(to: CGPoint(x: r.maxX - L, y: r.minY))
+                      p.addLine(to: CGPoint(x: r.maxX, y: r.minY))
+                      p.addLine(to: CGPoint(x: r.maxX, y: r.minY + L))
+                      p.move(to: CGPoint(x: r.maxX, y: r.maxY - L))
+                      p.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
+                      p.addLine(to: CGPoint(x: r.maxX - L, y: r.maxY))
+                      p.move(to: CGPoint(x: r.minX + L, y: r.maxY))
+                      p.addLine(to: CGPoint(x: r.minX, y: r.maxY))
+                      p.addLine(to: CGPoint(x: r.minX, y: r.maxY - L))
+                      ctx.addPath(p)
+                      ctx.strokePath()
+                  } else {
+                      if dashed {
+                          ctx.setLineDash(phase: CGFloat(-time * 50) * k, lengths: [8 * k, 6 * k])
+                      }
+                      ctx.stroke(r)
+                  }
+                  ctx.restoreGState()
+              }
+
+              static func glowFrame(_ ctx: CGContext, _ r: CGRect, _ it: DrawItem, _ lw: CGFloat,
+                                    _ al: CGFloat, _ time: Double, _ k: CGFloat) {
+                  ctx.saveGState()
+                  ctx.setShadow(offset: .zero, blur: lw * 3, color: col(it.color, al))
+                  strokeFrame(ctx, r, color: col(it.color, al), lw: lw,
+                              brackets: it.fx.has(.brackets), dashed: it.fx.has(.dashed), time: time, k: k)
+                  ctx.restoreGState()
+              }
+
+              /// Пикселизация внутри рамки. base это кадр без рамок (нужен, чтобы взять из него цвета).
+              static func pixelate(_ ctx: CGContext, _ r: CGRect, W: CGFloat, H: CGFloat,
+                                   base: CGImage?, time: Double, k: CGFloat) {
+                  let vr = r.intersection(CGRect(x: 0, y: 0, width: W, height: H))
+                  if vr.isNull || vr.width < 6 || vr.height < 6 { return }
+                  let cell = max(4, 8 * k)
+                  let tw = max(1, Int(ceil(vr.width / cell)))
+                  let th = max(1, Int(ceil(vr.height / cell)))
+                  ctx.saveGState()
+                  ctx.clip(to: vr)
+                  var done = false
+                  if let base {
+                      let sx = CGFloat(base.width) / W
+                      let sy = CGFloat(base.height) / H
+                      let crop = CGRect(x: vr.minX * sx, y: (H - vr.maxY) * sy, width: vr.width * sx, height: vr.height * sy)
+                          .integral
+                          .intersection(CGRect(x: 0, y: 0, width: base.width, height: base.height))
+                      if !crop.isNull, crop.width >= 1, crop.height >= 1, let piece = base.cropping(to: crop) {
+                          let info = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+                          if let small = CGContext(data: nil, width: tw, height: th, bitsPerComponent: 8, bytesPerRow: 0,
+                                                   space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: info) {
+                              small.interpolationQuality = .medium
+                              small.draw(piece, in: CGRect(x: 0, y: 0, width: tw, height: th))
+                              if let tiny = small.makeImage() {
+                                  ctx.interpolationQuality = .none
+                                  ctx.draw(tiny, in: vr)
+                                  done = true
+                              }
+                          }
+                      }
+                  }
+                  if !done {
+                      // кадра под рукой нет (идёт воспроизведение в превью): рисуем «шум» из квадратов
+                      for ry in 0..<th {
+                          for cx in 0..<tw {
+                              let v = 0.12 + 0.5 * rnd(ry * 1000 + cx, Int(time * 8))
+                              ctx.setFillColor(CGColor(gray: CGFloat(v), alpha: 0.9))
+                              ctx.fill(CGRect(x: vr.minX + CGFloat(cx) * cell, y: vr.minY + CGFloat(ry) * cell,
+                                              width: cell, height: cell))
+                          }
+                      }
+                  }
+                  ctx.restoreGState()
+              }
+
+              private struct Geo {
+                  let it: DrawItem
+                  var r: CGRect        // в пикселях, начало слева снизу
+                  var vanish: CGFloat  // 0...1, прогресс исчезновения
+                  var mode: Int        // вид исчезновения 0, 1 или 2
+                  var alpha: CGFloat
+                  var bump: CGFloat    // «сомнение»: 0...1
+              }
+
+              // MARK: Render
+
+              /// Рисует рамки и все эффекты в готовый контекст (начало слева снизу).
+              /// Этот же код рисует и превью, и экспорт, поэтому они совпадают.
+              static func render(in ctx: CGContext, W: CGFloat, H: CGFloat, items: [DrawItem],
+                                 time: Double, base: CGImage?) {
                   if items.isEmpty { return }
-                  CVPixelBufferLockBaseAddress(pb, [])
-                  defer { CVPixelBufferUnlockBaseAddress(pb, []) }
-                  guard let base = CVPixelBufferGetBaseAddress(pb) else { return }
-
-                  let w = CVPixelBufferGetWidth(pb)
-                  let h = CVPixelBufferGetHeight(pb)
-                  let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-                  guard let ctx = CGContext(
-                      data: base, width: w, height: h, bitsPerComponent: 8,
-                      bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
-                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: bitmapInfo
-                  ) else { return }
-
-                  let W = CGFloat(w), H = CGFloat(h)
-                  let lw = max(2, W * 0.004)
-                  let fontSize = max(14, W * 0.032)
+                  let k = W / 360
+                  let lw = max(1.5, W * 0.004)
+                  let fontSize = max(10, W * 0.032)
                   let stretch: CGFloat = 1.6
                   let font = CTFontCreateWithName("HelveticaNeue-CondensedBold" as CFString, fontSize, nil)
+                  let mono = "Menlo-Bold" as CFString
 
+                  // 1. Где рамка на самом деле: сомнение, lock-on и исчезновение двигают и масштабируют её.
+                  var geos: [Geo] = []
                   for it in items {
                       let n = it.rect
-                      let r = CGRect(x: n.minX * W, y: n.minY * H, width: n.width * W, height: n.height * H)
+                      var r = CGRect(x: n.minX * W, y: n.minY * H, width: n.width * W, height: n.height * H)
 
-                      ctx.saveGState()
-                      ctx.setShadow(offset: .zero, blur: lw * 3, color: it.color.cg) // glow
-                      ctx.setStrokeColor(it.color.cg)
-                      ctx.setLineWidth(lw)
-                      ctx.stroke(r)
-
-                      if !it.label.isEmpty {
-                          let attrs: [CFString: Any] = [
-                              kCTFontAttributeName: font,
-                              kCTForegroundColorAttributeName: it.textColor.cg
-                          ]
-                          let makeLine: (String) -> CTLine? = { s in
-                              guard let a = CFAttributedStringCreate(nil, s as CFString, attrs as CFDictionary) else { return nil }
-                              return CTLineCreateWithAttributedString(a)
+                      var bump: CGFloat = 0
+                      if it.fx.has(.doubt) {
+                          let a = it.age + Double(it.seed) * 0.7
+                          let ph = a.truncatingRemainder(dividingBy: 2.6)
+                          if ph < 0.9 {
+                              bump = CGFloat(sin(ph / 0.9 * Double.pi))
+                              let dir: CGFloat = (Int(floor(a / 2.6)) % 2 == 0) ? 1 : -1
+                              r.origin.x += bump * r.width * 0.9 * dir
                           }
+                      }
+
+                      var sc: CGFloat = 1
+                      if it.fx.has(.lockOn) {
+                          sc = 1 + 1.6 * CGFloat(exp(-6 * it.age) * cos(9 * it.age))
+                      }
+
+                      var vanish: CGFloat = 0
+                      let mode = abs(it.seed) % 3
+                      if it.fx.has(.vanish) && it.rem < 0.5 {
+                          vanish = CGFloat(1 - max(0, it.rem) / 0.5)
+                      }
+                      if vanish > 0 && mode == 0 { sc *= max(0.02, 1 - vanish) }
+
+                      if sc != 1 {
+                          let c = CGPoint(x: r.midX, y: r.midY)
+                          r = CGRect(x: c.x - r.width * sc / 2, y: c.y - r.height * sc / 2,
+                                     width: r.width * sc, height: r.height * sc)
+                      }
+
+                      var al: CGFloat = 1
+                      if vanish > 0 {
+                          if mode == 0 { al = 1 - vanish }
+                          if mode == 2 { al = (Int(time * 16) % 2 == 0) ? 1 : 0.15 }
+                      }
+                      geos.append(Geo(it: it, r: r, vanish: vanish, mode: mode, alpha: al, bump: bump))
+                  }
+
+                  // 2. Дождь из «?» на весь кадр
+                  if let rainIt = items.first(where: { $0.fx.has(.rainQ) }) {
+                      for j in 0..<22 {
+                          let sp = CGFloat(60 + rnd(j, 4) * 90) * k
+                          let phase = CGFloat(time) * sp + CGFloat(rnd(j, 5)) * H
+                          let yDown = phase.truncatingRemainder(dividingBy: H + 30 * k) - 15 * k
+                          let x = CGFloat(rnd(j, 3)) * W + CGFloat(sin(time * 3 + Double(j))) * 3 * k
+                          let size = CGFloat(10 + rnd(j, 6) * 10) * k
+                          put(ctx, "?", font: CTFontCreateWithName(mono, size, nil), color: col(rainIt.textColor),
+                              x: x, y: H - yDown, center: true, alpha: 0.4)
+                      }
+                  }
+
+                  // 3. Spotlight: весь кадр темнее, кроме рамок
+                  if items.contains(where: { $0.fx.has(.spot) }) {
+                      let path = CGMutablePath()
+                      path.addRect(CGRect(x: 0, y: 0, width: W, height: H))
+                      for g in geos { path.addRect(g.r) }
+                      ctx.saveGState()
+                      ctx.setFillColor(CGColor(gray: 0, alpha: 0.62))
+                      ctx.addPath(path)
+                      ctx.fillPath(using: .evenOdd)
+                      ctx.restoreGState()
+                  }
+
+                  // 4. Каждая рамка
+                  for g in geos {
+                      let it = g.it
+                      let r = g.r
+                      let fx = it.fx
+                      let seed = it.seed
+                      let al = g.alpha
+                      let lineW = it.selected ? lw * 1.6 : lw
+                      let squares = g.vanish > 0 && g.mode == 1
+
+                      // шлейф
+                      if fx.has(.trail) {
+                          for (n, tr) in it.trail.enumerated() {
+                              let tr2 = CGRect(x: tr.minX * W, y: tr.minY * H, width: tr.width * W, height: tr.height * H)
+                              let a = min(1, 0.55 / CGFloat(n + 1)) * al
+                              strokeFrame(ctx, tr2, color: col(it.color, a), lw: lineW,
+                                          brackets: fx.has(.brackets), dashed: false, time: time, k: k)
+                          }
+                      }
+
+                      // пикселизация
+                      if fx.has(.pixel) && g.vanish == 0 {
+                          pixelate(ctx, r, W: W, H: H, base: base, time: time, k: k)
+                      }
+
+                      // сама рамка
+                      if squares {
+                          ctx.saveGState()
+                          ctx.setFillColor(col(it.color, 1 - g.vanish))
+                          for n in 0..<16 {
+                              let per = CGFloat(n) / 16 * 4
+                              let side = Int(per)
+                              let f = per - CGFloat(side)
+                              let p: CGPoint
+                              switch side {
+                              case 0: p = CGPoint(x: r.minX + f * r.width, y: r.maxY)
+                              case 1: p = CGPoint(x: r.maxX, y: r.maxY - f * r.height)
+                              case 2: p = CGPoint(x: r.maxX - f * r.width, y: r.minY)
+                              default: p = CGPoint(x: r.minX, y: r.minY + f * r.height)
+                              }
+                              let dx = p.x - r.midX
+                              let dy = p.y - r.midY
+                              let d = max(1, hypot(dx, dy))
+                              let m = g.vanish * 40 * k * CGFloat(0.5 + rnd(n, seed))
+                              let sz = max(0, min(r.width, r.height) / 4 * (1 - g.vanish))
+                              let qx = p.x + dx / d * m - sz / 2
+                              let qy = p.y + dy / d * m - sz / 2
+                              ctx.fill(CGRect(x: qx, y: qy, width: sz, height: sz))
+                          }
+                          ctx.restoreGState()
+                      } else if fx.has(.rgb) {
+                          let j = rnd(Int(time * 25), seed)
+                          let j2 = rnd(Int(time * 25), seed + 3)
+                          let ox = CGFloat(j - 0.5) * 9 * k
+                          let oy = CGFloat(j2 - 0.5) * 5 * k
+                          strokeFrame(ctx, r.offsetBy(dx: ox, dy: oy), color: col(RGB(1.0, 0.16, 0.23), 0.85 * al),
+                                      lw: lineW, brackets: fx.has(.brackets), dashed: fx.has(.dashed), time: time, k: k)
+                          strokeFrame(ctx, r.offsetBy(dx: -ox, dy: -oy), color: col(RGB(0.16, 0.42, 1.0), 0.85 * al),
+                                      lw: lineW, brackets: fx.has(.brackets), dashed: fx.has(.dashed), time: time, k: k)
+                          if rnd(Int(time * 12), seed + 5) > 0.1 {
+                              glowFrame(ctx, r, it, lineW, al, time, k)
+                          }
+                      } else {
+                          glowFrame(ctx, r, it, lineW, al, time, k)
+                      }
+
+                      // сканирующая линия
+                      if fx.has(.scan) && g.vanish == 0 {
+                          let ph = CGFloat((time * 0.9 + Double(seed) * 0.3).truncatingRemainder(dividingBy: 1))
+                          let sy = r.maxY - ph * r.height
+                          ctx.saveGState()
+                          ctx.clip(to: r)
+                          if let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                                                   colors: [col(it.color, 0), col(it.color, 0.6)] as CFArray,
+                                                   locations: [0, 1]) {
+                              ctx.drawLinearGradient(grad, start: CGPoint(x: 0, y: sy + 12 * k),
+                                                     end: CGPoint(x: 0, y: sy), options: [])
+                          }
+                          ctx.setFillColor(col(it.color))
+                          ctx.fill(CGRect(x: r.minX, y: sy - 0.75 * k, width: r.width, height: 1.5 * k))
+                          ctx.restoreGState()
+                      }
+
+                      // подпись
+                      var text = it.label
+                      if g.vanish > 0 && g.mode == 2 {
+                          text = "LOST"
+                      } else if fx.has(.growQ) {
+                          text += String(repeating: "?", count: min(5, 1 + Int(max(0, it.age) / 0.9)))
+                      }
+                      if !text.isEmpty && !squares {
+                          let tcol = col(it.textColor, al)
                           let widthOf: (String) -> CGFloat = { s in
-                              guard let l = makeLine(s) else { return 0 }
+                              guard let l = makeLine(s, font, tcol) else { return 0 }
                               return CTLineGetBoundsWithOptions(l, []).width
                           }
-
                           let maxW = max(r.width, W * 0.25)
-                          let plain = wrap(it.label.lowercased(), maxW, widthOf)
-                          let shown = Glitch.text(plain.joined(separator: "\n"), time: time, seed: it.seed)
+                          let plain = wrap(text.lowercased(), maxW, widthOf)
+                          var shown = Glitch.text(plain.joined(separator: "\n"), time: time, seed: seed)
+                          if fx.has(.typing) {
+                              let n = max(0, Int(it.age * 9))
+                              let full = n >= shown.count
+                              shown = String(shown.prefix(n))
+                              if !full || Int(time * 3) % 2 == 0 { shown += "_" }
+                          }
                           let lines = shown.components(separatedBy: "\n")
 
                           let lineH = fontSize * stretch * 1.05
@@ -1042,20 +1464,136 @@ jobs:
                           let clampedX = min(max(4, r.minX), max(4, W - blockW - 4))
                           let x = r.minX + (clampedX - r.minX) * min(1, visible)
 
-                          let aboveBase = r.maxY + lw + 3
+                          let aboveBase = r.maxY + lineW + 3
                           let below = aboveBase + blockH > H && r.minY - 3 - blockH >= 0
 
-                          for (j, text) in lines.enumerated() {
+                          ctx.saveGState()
+                          ctx.setShadow(offset: .zero, blur: lw * 3, color: col(it.color, al))
+                          for (j, s) in lines.enumerated() {
                               let y: CGFloat = below
                                   ? (r.minY - 3) - CGFloat(j + 1) * lineH
                                   : aboveBase + CGFloat(lines.count - 1 - j) * lineH
-                              guard let line = makeLine(text) else { continue }
+                              guard let line = makeLine(s, font, tcol) else { continue }
                               ctx.textMatrix = CGAffineTransform(scaleX: 1, y: stretch)
                               ctx.textPosition = CGPoint(x: x, y: y)
                               CTLineDraw(line, ctx)
                           }
+                          ctx.restoreGState()
+                          ctx.textMatrix = .identity
                       }
-                      ctx.restoreGState()
+
+                      // служебные данные
+                      if fx.has(.data) && g.vanish == 0 {
+                          let st = Int(time * 7)
+                          let rows = [
+                              String(format: "ID %04ld", 427 + (seed * 137) % 9000),
+                              String(format: "X %.2f  Y %.2f", Double(r.midX / W), Double(r.midY / H)),
+                              String(format: "CONF %.2f", 0.8 + 0.19 * rnd(st, seed))
+                          ]
+                          let df = CTFontCreateWithName(mono, 9 * k, nil)
+                          var top = r.minY - 12 * k
+                          if top - 20 * k < 2 { top = r.minY + 32 * k }
+                          let dx = max(4, min(r.minX, W - 90 * k))
+                          for (n, s) in rows.enumerated() {
+                              put(ctx, s, font: df, color: col(it.color, al), x: dx, y: top - CGFloat(n) * 10 * k)
+                          }
+                      }
+
+                      // вылетающие «?»
+                      if fx.has(.flyQ) && g.vanish == 0 {
+                          for j in 0..<10 {
+                              let per = 1.1 + 0.5 * rnd(j, seed)
+                              let ph = (time / per + rnd(j, seed + 9)).truncatingRemainder(dividingBy: 1)
+                              let ang = rnd(j, seed + 3) * 2 * Double.pi
+                              let reach = CGFloat(ph) * 30 * k
+                              let rx = r.width / 2 * 0.9 + reach
+                              let ry = r.height / 2 * 0.9 + reach
+                              let jx = CGFloat(sin(time * 30 + Double(j))) * 1.5 * k
+                              let jy = CGFloat(cos(time * 27 + Double(j))) * 1.5 * k
+                              let px = r.midX + CGFloat(cos(ang)) * rx + jx
+                              let py = r.midY + CGFloat(sin(ang)) * ry + jy
+                              let size = CGFloat(8 + ph * 14) * k
+                              put(ctx, "?", font: CTFontCreateWithName(mono, size, nil), color: col(it.textColor),
+                                  x: px, y: py, center: true, rot: CGFloat(sin(time * 6 + Double(j)) * 0.4),
+                                  alpha: CGFloat(sin(ph * Double.pi)))
+                          }
+                      }
+
+                      // «?» в кружке на углу
+                      if fx.has(.cornerQ) && g.vanish == 0 {
+                          let rad = CGFloat(9 + 1.5 * sin(time * 7)) * k
+                          ctx.saveGState()
+                          ctx.setFillColor(col(it.color))
+                          ctx.fillEllipse(in: CGRect(x: r.maxX - rad, y: r.maxY - rad, width: rad * 2, height: rad * 2))
+                          ctx.restoreGState()
+                          put(ctx, "?", font: CTFontCreateWithName(mono, rad * 1.3, nil), color: CGColor(gray: 0.04, alpha: 1),
+                              x: r.maxX, y: r.maxY, center: true, rot: CGFloat(sin(time * 4) * 0.3))
+                      }
+
+                      // вспышка «?» в момент сомнения
+                      if g.bump > 0.3 {
+                          put(ctx, "?", font: CTFontCreateWithName(mono, (16 + 14 * g.bump) * k, nil), color: col(it.textColor),
+                              x: r.midX, y: r.maxY + 26 * k, center: true, alpha: g.bump)
+                      }
+                  }
+
+                  // 5. Линии между рамками с «расстоянием»
+                  let linked = geos.filter { $0.it.fx.has(.links) && $0.vanish == 0 }
+                  if linked.count >= 2 {
+                      let lf = CTFontCreateWithName(mono, 10 * k, nil)
+                      for n in 0..<(linked.count - 1) {
+                          let a = linked[n]
+                          let b = linked[n + 1]
+                          ctx.saveGState()
+                          ctx.setStrokeColor(col(a.it.color, 0.7))
+                          ctx.setLineWidth(max(1, lw * 0.5))
+                          ctx.setLineDash(phase: 0, lengths: [4 * k, 4 * k])
+                          ctx.move(to: CGPoint(x: a.r.midX, y: a.r.midY))
+                          ctx.addLine(to: CGPoint(x: b.r.midX, y: b.r.midY))
+                          ctx.strokePath()
+                          ctx.restoreGState()
+                          let d = Int(hypot(a.r.midX - b.r.midX, a.r.midY - b.r.midY) / W * 1000)
+                          put(ctx, "d=\(d)", font: lf, color: col(a.it.color),
+                              x: (a.r.midX + b.r.midX) / 2, y: (a.r.midY + b.r.midY) / 2 + 5 * k, center: true)
+                      }
+                  }
+              }
+
+              // MARK: Entry points
+
+              /// Экспорт: рисует прямо в BGRA-буфер кадра.
+              static func draw(on pb: CVPixelBuffer, items: [DrawItem], time: Double) {
+                  if items.isEmpty { return }
+                  CVPixelBufferLockBaseAddress(pb, [])
+                  defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+                  guard let ptr = CVPixelBufferGetBaseAddress(pb) else { return }
+
+                  let w = CVPixelBufferGetWidth(pb)
+                  let h = CVPixelBufferGetHeight(pb)
+                  let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+                  guard let ctx = CGContext(
+                      data: ptr, width: w, height: h, bitsPerComponent: 8,
+                      bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: bitmapInfo
+                  ) else { return }
+
+                  // для пикселизации нужен чистый кадр: снимаем его до того, как что-то нарисовано
+                  let snap: CGImage? = items.contains(where: { $0.fx.has(.pixel) }) ? ctx.makeImage() : nil
+                  render(in: ctx, W: CGFloat(w), H: CGFloat(h), items: items, time: time, base: snap)
+              }
+
+              /// Превью: тот же рисунок в виде прозрачной картинки поверх плеера.
+              static func image(items: [DrawItem], size: CGSize, time: Double, base: CGImage?) -> UIImage? {
+                  guard !items.isEmpty, size.width > 4, size.height > 4 else { return nil }
+                  let f = UIGraphicsImageRendererFormat()
+                  f.scale = 2
+                  f.opaque = false
+                  let renderer = UIGraphicsImageRenderer(size: size, format: f)
+                  return renderer.image { rc in
+                      let cg = rc.cgContext
+                      cg.translateBy(x: 0, y: size.height)
+                      cg.scaleBy(x: 1, y: -1)
+                      render(in: cg, W: size.width, H: size.height, items: items, time: time, base: base)
                   }
               }
           }
@@ -1164,7 +1702,7 @@ jobs:
                               var items: [DrawItem] = []
                               if blobsOn {
                                   let rects = BlobDetector.detect(pixelBuffer: pb, settings: bs)
-                                  items = TL.blobItems(rects, bs)
+                                  items = TL.blobItems(rects, bs, time: t)
                               }
                               items.append(contentsOf: TL.items(clips, boxes, t))
                               Overlay.draw(on: pb, items: items, time: t)
@@ -1240,6 +1778,7 @@ jobs:
               @Published var selectedClipID: UUID?
               @Published var proposals: [CGRect] = []
               @Published var blobRects: [CGRect] = []
+              @Published var baseFrame: CGImage?
               @Published var busy = false
               @Published var exporting = false
               @Published var progress = 0.0
@@ -1261,6 +1800,7 @@ jobs:
               private var rebuildTask: Task<Void, Never>?
               private var lastFrame: (Double, CGImage)?
               private var blobGen = 0
+              private var baseGen = 0
               private var history: [Data] = []
               private var histIdx = 0
 
@@ -1407,6 +1947,7 @@ jobs:
                   let c = clips
                   let m = music
                   let r = renderSize
+                  let bp = beepTimes()
 
                   guard !c.isEmpty else {
                       built = nil
@@ -1419,7 +1960,7 @@ jobs:
 
                   rebuildTask = Task { @MainActor in
                       do {
-                          let b = try await Builder.build(clips: c, music: m, render: r)
+                          let b = try await Builder.build(clips: c, music: m, render: r, beeps: bp)
                           if Task.isCancelled { return }
                           self.built = b
                           let item = AVPlayerItem(asset: b.comp)
@@ -1459,6 +2000,7 @@ jobs:
                   guard built != nil else { return }
                   if currentTime >= total - 0.05 { seek(0) }
                   proposals = []
+                  baseFrame = nil
                   player.play()
                   isPlaying = true
               }
@@ -1716,6 +2258,7 @@ jobs:
                         let bi = boxes.firstIndex(where: { $0.id == id }),
                         boxes[bi].srcID == l.clip.srcID else { return }
                   boxes[bi].startT = l.src
+                  if boxes[bi].fx.has(.beep) { rebuild() }
               }
 
               func setEndHere(_ id: UUID) {
@@ -1731,8 +2274,10 @@ jobs:
               }
 
               func deleteBox(_ id: UUID) {
+                  let hadBeep = boxes.first(where: { $0.id == id })?.fx.has(.beep) ?? false
                   boxes.removeAll { $0.id == id }
                   if selectedBoxID == id { selectedBoxID = nil }
+                  if hadBeep { rebuild() }
               }
 
               func jump(toBox b: Box) {
@@ -1756,9 +2301,55 @@ jobs:
                   }
               }
 
+              // MARK: - Effects
+
+              private func beepTimes() -> [Double] {
+                  var out: [Double] = []
+                  for b in boxes where b.fx.has(.beep) {
+                      if let sp = boxSpan(b) { out.append(sp.0) }
+                  }
+                  return out.sorted()
+              }
+
+              /// Кадр без рамок: из него пикселизация в превью берёт цвета (пока видео стоит).
+              func refreshBase() {
+                  let need = boxes.contains(where: { $0.fx.has(.pixel) }) || (useBlobs && blob.fx.has(.pixel))
+                  guard need, !isPlaying else {
+                      if baseFrame != nil { baseFrame = nil }
+                      return
+                  }
+                  let t = currentTime
+                  baseGen += 1
+                  let g = baseGen
+                  Task { @MainActor in
+                      let img = await self.frameImage(at: t)
+                      if g == self.baseGen { self.baseFrame = img }
+                  }
+              }
+
+              func toggleFX(_ id: UUID, _ k: FXKind) {
+                  guard let i = boxes.firstIndex(where: { $0.id == id }) else { return }
+                  boxes[i].fx.toggle(k)
+                  if k == .beep { rebuild() }
+                  if k == .pixel { refreshBase() }
+              }
+
+              func setFX(_ id: UUID, _ s: Set<FXKind>) {
+                  guard let i = boxes.firstIndex(where: { $0.id == id }) else { return }
+                  boxes[i].fx.on = s
+                  rebuild()
+              }
+
+              func copyFXToAll(from id: UUID) {
+                  guard let src = boxes.first(where: { $0.id == id }) else { return }
+                  for i in boxes.indices { boxes[i].fx = src.fx }
+                  rebuild()
+              }
+
               // MARK: - Blobs
 
               func refreshBlobs() {
+                  refreshBase()
                   guard useBlobs else {
                       blobRects = []
                       return
@@ -1801,11 +2392,12 @@ jobs:
                   let m = music
                   let target = Editor.exportSize(renderSize, quality)
                   let base = renderSize
+                  let bp = beepTimes()
                   Task { @MainActor in
                       do {
                           var bt = b
                           if target != base {
-                              bt = try await Builder.build(clips: cl, music: m, render: target)
+                              bt = try await Builder.build(clips: cl, music: m, render: target, beeps: bp)
                           }
                           let url = try await VideoExporter().run(built: bt, clips: cl, boxes: bx, blobs: bs) { p in
                               DispatchQueue.main.async { self.progress = p }
@@ -2300,6 +2892,9 @@ jobs:
               @State private var confirmClose = false
               @State private var detectMode: DetectMode = .rects
               @State private var zoomIdx = 1
+              @State private var boxTab: BoxTab = .look
+              @State private var panelTall = false
+              @State private var blobFXOpen = false
 
               // жесты на превью
               @State private var dragKind: DragKind = .none
@@ -2315,6 +2910,13 @@ jobs:
                   case blobs = "Блобы"
                   case trim = "Обрезка"
                   case audio = "Звук"
+                  var id: String { rawValue }
+              }
+
+              enum BoxTab: String, CaseIterable, Identifiable {
+                  case look = "Вид"
+                  case fx = "Эффекты"
+                  case time = "Время"
                   var id: String { rawValue }
               }
 
@@ -2335,7 +2937,7 @@ jobs:
                           .alert("Как пользоваться", isPresented: $showHelp) {
                               Button("OK", role: .cancel) {}
                           } message: {
-                              Text("Рамка: открой «Рамки» и нарисуй её пальцем на кадре, дальше она поедет за объектом сама. Тащи рамку или белую точку в углу, чтобы поправить: трекинг пересчитается с этого кадра.\n\nТаймлайн: тяни его пальцем, курсор стоит по центру. Тап по клипу выбирает его, тап по рамке в нижней дорожке открывает её настройки.\n\nБлобы: рамки вокруг ярких, тёмных или одноцветных пятен на всём видео.")
+                              Text("Рамка: открой «Рамки» и нарисуй её пальцем на кадре, дальше она поедет за объектом сама. Тащи рамку или белую точку в углу, чтобы поправить: трекинг пересчитается с этого кадра.\n\nТаймлайн: тяни его пальцем, курсор стоит по центру. Тап по клипу выбирает его, тап по рамке в нижней дорожке открывает её настройки.\n\nБлобы: рамки вокруг ярких, тёмных или одноцветных пятен на всём видео.\n\nЭффекты: выбери рамку и открой вкладку «Эффекты». Набор можно скопировать на все рамки одной кнопкой.")
                           }
 
                       previewArea
@@ -2493,21 +3095,6 @@ jobs:
                       let H = geo.size.height
                       let vis = ed.visibleBoxes()
                       ZStack(alignment: .topLeading) {
-                          if ed.useBlobs {
-                              ForEach(ed.blobRects.indices, id: \.self) { i in
-                                  let r = uiRect(ed.blobRects[i], W, H)
-                                  Rectangle()
-                                      .stroke(ed.blob.color.ui, lineWidth: 2)
-                                      .frame(width: r.width, height: r.height)
-                                      .offset(x: r.minX, y: r.minY)
-                                  if !ed.blob.labelList.isEmpty {
-                                      GlitchLabel(text: ed.blob.labelList[i % ed.blob.labelList.count],
-                                                  color: ed.blob.textColor, seed: i, rect: r,
-                                                  minWidth: W * 0.25, time: ed.currentTime)
-                                  }
-                              }
-                          }
-
                           ForEach(ed.proposals.indices, id: \.self) { i in
                               let r = uiRect(ed.proposals[i], W, H)
                               Rectangle()
@@ -2516,25 +3103,22 @@ jobs:
                                   .offset(x: r.minX, y: r.minY)
                           }
 
-                          ForEach(vis, id: \.index) { v in
+                          // рамки, блобы и все эффекты рисует тот же код, что и экспорт
+                          if let img = fxImage(W, H) {
+                              Image(uiImage: img)
+                                  .resizable()
+                                  .frame(width: W, height: H)
+                                  .allowsHitTesting(false)
+                          }
+
+                          if let sid = ed.selectedBoxID, let v = vis.first(where: { $0.box.id == sid }) {
                               let rect = (overrideID == v.box.id) ? overrideRect : v.rect
                               let r = uiRect(rect, W, H)
-                              let selected = ed.selectedBoxID == v.box.id
-                              Rectangle()
-                                  .stroke(v.box.color.ui, lineWidth: selected ? 3.5 : 2)
-                                  .frame(width: r.width, height: r.height)
-                                  .offset(x: r.minX, y: r.minY)
-                              if !v.box.label.isEmpty {
-                                  GlitchLabel(text: v.box.label, color: v.box.textColor, seed: v.index,
-                                              rect: r, minWidth: W * 0.25, time: ed.currentTime)
-                              }
-                              if selected {
-                                  Circle()
-                                      .fill(Color.white)
-                                      .frame(width: 18, height: 18)
-                                      .position(x: r.maxX, y: r.maxY)
-                                      .allowsHitTesting(false)
-                              }
+                              Circle()
+                                  .fill(Color.white)
+                                  .frame(width: 18, height: 18)
+                                  .position(x: r.maxX, y: r.maxY)
+                                  .allowsHitTesting(false)
                           }
 
                           if let d = draft {
@@ -2552,6 +3136,18 @@ jobs:
                               .onEnded { v in dragEnded(v, W, H) }
                       )
                   }
+              }
+
+              private func fxImage(_ W: CGFloat, _ H: CGFloat) -> UIImage? {
+                  var items: [DrawItem] = []
+                  if ed.useBlobs {
+                      items = TL.blobItems(ed.blobRects, ed.blob, time: ed.currentTime)
+                  }
+                  var ov: (id: UUID, rect: CGRect)? = nil
+                  if let oid = overrideID { ov = (id: oid, rect: overrideRect) }
+                  items += TL.items(ed.clips, ed.boxes, ed.currentTime, selected: ed.selectedBoxID, dragged: ov)
+                  return Overlay.image(items: items, size: CGSize(width: W, height: H),
+                                       time: ed.currentTime, base: ed.baseFrame)
               }
 
               // MARK: - Gestures
@@ -2756,6 +3352,16 @@ jobs:
                       HStack {
                           Text(p.rawValue).font(.system(size: 17, weight: .bold))
                           Spacer()
+                          if p == .boxes || p == .blobs {
+                              Button { panelTall.toggle() } label: {
+                                  Image(systemName: panelTall ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                                      .font(.system(size: 14, weight: .bold))
+                                      .foregroundStyle(.white)
+                                      .frame(width: 44, height: 32)
+                                      .background(Theme.tile, in: Capsule())
+                              }
+                              .buttonStyle(.plain)
+                          }
                           Button { panel = nil } label: {
                               Image(systemName: "checkmark")
                                   .font(.system(size: 15, weight: .bold))
@@ -2782,7 +3388,7 @@ jobs:
                           .padding(.bottom, 20)
                       }
                   }
-                  .frame(height: 270)
+                  .frame(height: panelTall ? 400 : 270)
                   .background {
                       UnevenRoundedRectangle(topLeadingRadius: 24, topTrailingRadius: 24)
                           .fill(Theme.panel)
@@ -2815,8 +3421,6 @@ jobs:
 
               private var boxesBody: some View {
                   VStack(alignment: .leading, spacing: 12) {
-                      hint("Нарисуй рамку пальцем на кадре, трекинг пойдёт от этого момента. Тащи рамку или белую точку в углу: трекинг пересчитается с этого кадра.")
-
                       HStack {
                           Menu {
                               Picker("Что искать", selection: $detectMode) {
@@ -2854,40 +3458,107 @@ jobs:
                       }
 
                       if let i = ed.boxes.firstIndex(where: { $0.id == ed.selectedBoxID }) {
-                          let id = ed.boxes[i].id
-                          TextField("Подпись (например: do you see him too?)", text: $ed.boxes[i].label)
-                              .textFieldStyle(.roundedBorder)
-
-                          HStack {
-                              Button("OFFLINE") {
-                                  ed.boxes[i].label = "OFFLINE"
-                                  ed.boxes[i].color = .red
-                                  ed.boxes[i].textColor = .red
-                              }
-                              Button("ONLINE") {
-                                  ed.boxes[i].label = "ONLINE"
-                                  ed.boxes[i].color = .green
-                                  ed.boxes[i].textColor = .green
-                              }
+                          Picker("", selection: $boxTab) {
+                              ForEach(BoxTab.allCases) { Text($0.rawValue).tag($0) }
                           }
-                          .buttonStyle(ChipButtonStyle())
+                          .pickerStyle(.segmented)
 
-                          ColorRow(title: "Цвет рамки", selection: $ed.boxes[i].color)
-                          ColorRow(title: "Цвет текста", selection: $ed.boxes[i].textColor)
-
-                          HStack {
-                              Button("Начало тут") { ed.setStartHere(id) }
-                              Button("Конец тут") { ed.setEndHere(id) }
-                              Button("Без конца") { ed.clearEnd(id) }
+                          switch boxTab {
+                          case .look: lookBody(i)
+                          case .fx: fxBody(i)
+                          case .time: timeBody(i)
                           }
-                          .buttonStyle(ChipButtonStyle())
+                      } else {
+                          hint("Нарисуй рамку пальцем на кадре, трекинг пойдёт от этого момента. Потом выбери её здесь: подпись и цвет на вкладке «Вид», анимации на вкладке «Эффекты», начало и конец на вкладке «Время».")
+                      }
+                  }
+              }
 
-                          HStack {
-                              Button("Перетрекать отсюда") { ed.retrackSelected() }
-                                  .buttonStyle(ChipButtonStyle())
-                              Spacer()
-                              Button("Удалить") { ed.deleteBox(id) }
-                                  .buttonStyle(ChipButtonStyle(danger: true))
+              @ViewBuilder
+              private func lookBody(_ i: Int) -> some View {
+                  let id = ed.boxes[i].id
+                  TextField("Подпись (например: do you see him too?)", text: $ed.boxes[i].label)
+                      .textFieldStyle(.roundedBorder)
+
+                  HStack {
+                      Button("OFFLINE") {
+                          ed.boxes[i].label = "OFFLINE"
+                          ed.boxes[i].color = .red
+                          ed.boxes[i].textColor = .red
+                      }
+                      Button("ONLINE") {
+                          ed.boxes[i].label = "ONLINE"
+                          ed.boxes[i].color = .green
+                          ed.boxes[i].textColor = .green
+                      }
+                      Spacer()
+                      Button("Удалить") { ed.deleteBox(id) }
+                          .buttonStyle(ChipButtonStyle(danger: true))
+                  }
+                  .buttonStyle(ChipButtonStyle())
+
+                  ColorRow(title: "Цвет рамки", selection: $ed.boxes[i].color)
+                  ColorRow(title: "Цвет текста", selection: $ed.boxes[i].textColor)
+              }
+
+              @ViewBuilder
+              private func fxBody(_ i: Int) -> some View {
+                  let id = ed.boxes[i].id
+                  let on = ed.boxes[i].fx.on
+                  HStack {
+                      Button("Пакет из 5") { ed.setFX(id, BoxFX.pack) }
+                      Button("Сбросить") { ed.setFX(id, []) }
+                      Button("Всем рамкам") { ed.copyFXToAll(from: id) }
+                      Spacer(minLength: 0)
+                  }
+                  .buttonStyle(ChipButtonStyle())
+
+                  hint(on.isEmpty
+                       ? "Выбери анимации: они сразу видны в превью, при воспроизведении тоже."
+                       : "Включено: \(on.count). «Всем рамкам» копирует этот набор на остальные.")
+
+                  fxGroups(FXKind.allCases, on: on) { k in ed.toggleFX(id, k) }
+              }
+
+              @ViewBuilder
+              private func timeBody(_ i: Int) -> some View {
+                  let id = ed.boxes[i].id
+                  hint("Поставь курсор на нужный кадр и нажми кнопку.")
+                  HStack {
+                      Button("Начало тут") { ed.setStartHere(id) }
+                      Button("Конец тут") { ed.setEndHere(id) }
+                      Button("Без конца") { ed.clearEnd(id) }
+                  }
+                  .buttonStyle(ChipButtonStyle())
+
+                  Button("Перетрекать отсюда") { ed.retrackSelected() }
+                      .buttonStyle(ChipButtonStyle())
+              }
+
+              /// Сетка включаемых эффектов по группам (для рамок и для блобов).
+              private func fxGroups(_ kinds: [FXKind], on: Set<FXKind>,
+                                    toggle: @escaping (FXKind) -> Void) -> some View {
+                  VStack(alignment: .leading, spacing: 14) {
+                      ForEach(FXGroup.allCases) { g in
+                          let items = kinds.filter { $0.group == g }
+                          if !items.isEmpty {
+                              VStack(alignment: .leading, spacing: 6) {
+                                  Text(g.rawValue)
+                                      .font(.footnote.weight(.semibold))
+                                      .foregroundStyle(.secondary)
+                                  LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 8)],
+                                            alignment: .leading, spacing: 8) {
+                                      ForEach(items) { k in
+                                          Button { toggle(k) } label: {
+                                              Text(k.title)
+                                                  .lineLimit(1)
+                                                  .minimumScaleFactor(0.8)
+                                                  .frame(maxWidth: .infinity)
+                                          }
+                                          .buttonStyle(ChipButtonStyle(selected: on.contains(k)))
+                                      }
+                                  }
+                              }
                           }
                       }
                   }
@@ -2927,6 +3598,14 @@ jobs:
 
                           ColorRow(title: "Цвет рамок", selection: $ed.blob.color)
                           ColorRow(title: "Цвет текста", selection: $ed.blob.textColor)
+
+                          DisclosureGroup("Эффекты рамок", isExpanded: $blobFXOpen) {
+                              fxGroups(FXKind.blobKinds, on: ed.blob.fx.on) { k in
+                                  ed.blob.fx.toggle(k)
+                                  if k == .pixel { ed.refreshBase() }
+                              }
+                              .padding(.top, 8)
+                          }
                       }
                   }
               }
