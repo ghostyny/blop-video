@@ -252,6 +252,7 @@ jobs:
               case people = "Люди"
               case faces = "Лица"
               case text = "Текст"
+              case foreground = "Объект по тапу"
               var id: String { rawValue }
           }
 
@@ -529,6 +530,9 @@ jobs:
                       let r = VNDetectFaceRectanglesRequest()
                       try? handler.perform([r])
                       return (r.results ?? []).map { $0.boundingBox }
+
+                  case .foreground:
+                      return ForegroundPicker.rects(image)
 
                   case .text:
                       let r = VNRecognizeTextRequest()
@@ -3528,6 +3532,10 @@ jobs:
                           }
                       } else {
                           ed.selectedBoxID = nil
+                          if detectMode == .foreground {
+                              ed.pickObject(nx: Double(v.location.x / W), ny: Double(v.location.y / H))
+                              panel = .boxes
+                          }
                       }
                   case .adopt(let r):
                       if moved <= 10 {
