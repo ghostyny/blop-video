@@ -193,15 +193,22 @@ enum GrowPicker {
 // MARK: - Редактор
 
 extension Editor {
-    /// Тап по объекту: рамка вырастает из точки и дальше трекается как обычная.
+    /// Тап по объекту: сначала ищем его по маске Vision (точный контур),
+    /// если не нашли, рамка вырастает из точки по цвету. Дальше трекинг ведёт её как обычную.
     func pickObject(nx: Double, ny: Double) {
         pause()
         let t = currentTime
         Task { @MainActor in
             guard let cg = await self.frameImage(at: t) else { return }
-            let r = await Task.detached { GrowPicker.rect(image: cg, nx: nx, ny: ny) }.value
-            if let r = r {
-                self.addBox(r)
+            let found = await Task.detached { () -> (CGRect, Bool)? in
+                let insts = ObjectSeg.instances(image: cg)
+                if let o = ObjectSeg.at(insts, nx: nx, ny: ny) { return (o.rect, true) }
+                if let r = GrowPicker.rect(image: cg, nx: nx, ny: ny) { return (r, false) }
+                return nil
+            }.value
+            if let f = found {
+                self.addBox(f.0)
+                if f.1 { self.markObject() }
             } else {
                 self.message = "Не получилось выделить объект. Нарисуй рамку пальцем."
             }
