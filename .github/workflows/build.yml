@@ -110,6 +110,7 @@ jobs:
           /// Эффекты рамки. Каждый считается только от времени и seed,
           /// поэтому в превью и в готовом видео они выглядят одинаково.
           enum FXGroup: String, CaseIterable, Identifiable {
+              case object = "Объект: точное выделение"
               case question = "Знак вопроса"
               case frame = "Рамка"
               case text = "Подпись и данные"
@@ -122,6 +123,7 @@ jobs:
               case lockOn, brackets, rgb, trail, scan, dashed, links
               case typing, data
               case vanish, pixel, spot, beep
+              case contour, textOn, textBehind
 
               var id: String { rawValue }
 
@@ -145,6 +147,9 @@ jobs:
                   case .pixel: return "Пикселизация"
                   case .spot: return "Spotlight"
                   case .beep: return "Писк"
+                  case .contour: return "Точный контур"
+                  case .textOn: return "Текст на объекте"
+                  case .textBehind: return "Текст за объектом"
                   }
               }
 
@@ -154,6 +159,7 @@ jobs:
                   case .lockOn, .brackets, .rgb, .trail, .scan, .dashed, .links: return .frame
                   case .typing, .data: return .text
                   case .vanish, .pixel, .spot, .beep: return .scene
+                  case .contour, .textOn, .textBehind: return .object
                   }
               }
 
@@ -1985,6 +1991,7 @@ jobs:
                                   items = TL.blobItems(rects, bs, time: t)
                               }
                               items.append(contentsOf: TL.items(clips, boxes, t))
+                              ObjectFX.draw(on: pb, items: &items, time: t)
                               Overlay.draw(on: pb, items: items, time: t)
 
                               if !adaptor.append(pb, withPresentationTime: pts) {
@@ -2265,6 +2272,7 @@ jobs:
               private func tick(_ t: Double) {
                   if scrubbing || abs(t - currentTime) < 0.001 { return }
                   currentTime = t
+                  objTick()
                   if isPlaying && useBlobs {
                       let it = player.currentTime()
                       if let pb = videoOutput.copyPixelBuffer(forItemTime: it, itemTimeForDisplay: nil) {
@@ -2615,6 +2623,7 @@ jobs:
                   boxes[i].fx.toggle(k)
                   if k == .beep { rebuild() }
                   if k == .pixel { refreshBase() }
+                  objRefresh()
               }
 
               func setFX(_ id: UUID, _ s: Set<FXKind>) {
@@ -2651,6 +2660,7 @@ jobs:
 
               func refreshBlobs() {
                   refreshBase()
+                  objRefresh()
                   guard useBlobs else {
                       blobRects = []
                       return
@@ -3447,7 +3457,7 @@ jobs:
                   var ov: (id: UUID, rect: CGRect)? = nil
                   if let oid = overrideID { ov = (id: oid, rect: overrideRect) }
                   items += TL.items(ed.clips, ed.boxes, ed.currentTime, selected: ed.selectedBoxID, dragged: ov)
-                  return Overlay.image(items: items, size: CGSize(width: W, height: H),
+                  return ObjectFX.image(items: items, size: CGSize(width: W, height: H),
                                        time: ed.currentTime, base: ed.baseFrame)
               }
 
@@ -3540,6 +3550,7 @@ jobs:
                   case .adopt(let r):
                       if moved <= 10 {
                           ed.addBox(r)
+                          if detectMode == .foreground { ed.markObject() }
                           ed.proposals.removeAll { $0 == r }
                           panel = .boxes
                       }
